@@ -1,0 +1,20 @@
+# Ignore generated files and directories
+output/
+message_to_user.md
+
+# Python-specific ignores
+__pycache__/
+*.pyc
+.pytest_cache/
+backend/__pycache__
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+*.onnx
+*.bias
+whisper_onnx_model/onnx__*
+whisper_onnx_model
+whisper_onnx_quantized_model

@@ -1,0 +1,23 @@
+Multiple distributions found for package optimum. Picked distribution: optimum-onnx
+WARNING[XFORMERS]: xFormers can't load C++/CUDA extensions. xFormers was built for:
+    PyTorch 2.6.0+cu124 with CUDA 1204 (you have 2.5.1+cu124)
+    Python  3.12.9 (you have 3.12.9)
+  Please reinstall xformers (see https://github.com/facebookresearch/xformers#installing-xformers)
+  Memory-efficient attention, SwiGLU, sparse and more won't be available.
+  Set XFORMERS_MORE_DETAILS=1 for more details
+`torch_dtype` is deprecated! Use `dtype` instead!
+Using a slow image processor as `use_fast` is unset and a slow processor was saved with this model. `use_fast=True` will be the default behavior in v4.52, even if the model was saved with a slow processor. This will result in minor differences in outputs. You'll still be able to use a slow processor with `use_fast=False`.
+Moving the following attributes in the config to the generation config: {'max_length': 448, 'begin_suppress_tokens': [220, 50257]}. You are seeing this warning because you've set generation parameters in the model config, as opposed to in the generation config.
+/home/010796032/.conda/envs/py312/lib/python3.12/site-packages/transformers/models/whisper/modeling_whisper.py:669: TracerWarning: Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  if input_features.shape[-1] != expected_seq_length:
+/home/010796032/.conda/envs/py312/lib/python3.12/site-packages/transformers/integrations/sdpa_attention.py:81: TracerWarning: Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  is_causal = query.shape[2] > 1 and attention_mask is None and getattr(module, "is_causal", True)
+/home/010796032/.conda/envs/py312/lib/python3.12/site-packages/transformers/cache_utils.py:132: TracerWarning: Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  if not self.is_initialized or self.keys.numel() == 0:
+/home/010796032/.conda/envs/py312/lib/python3.12/site-packages/transformers/integrations/sdpa_attention.py:86: TracerWarning: Converting a tensor to a Python number might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  is_causal = is_causal.item()
+Moving the following attributes in the config to the generation config: {'max_length': 448, 'begin_suppress_tokens': [220, 50257]}. You are seeing this warning because you've set generation parameters in the model config, as opposed to in the generation config.
+
+Exporting openai/whisper-large-v3 to ONNX format in whisper_onnx_model...
+Model exported successfully!
+
