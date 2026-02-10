@@ -1,0 +1,41 @@
+{
+  "meta": {
+    "timestamp": "20260209-140341",
+    "base": "unsloth/Qwen2.5-Coder-14B-Instruct",
+    "fine": "./qwen_coder_lora",
+    "device": "cuda",
+    "use_4bit_for_eval": false,
+    "ppl": {
+      "max_len": 2048,
+      "stride": 512,
+      "samples": 32
+    },
+    "induction": {
+      "seq_len": 256,
+      "samples": 20
+    },
+    "passkey": {
+      "ctx": 4096,
+      "depth": 0.5,
+      "trials": 10
+    },
+    "humaneval": {
+      "n": 40,
+      "max_new_tokens": 512
+    }
+  },
+  "base": {
+    "PPL_WikiText2": 17.800622923682106,
+    "PPL_MBPP": 12.165924606838066,
+    "Induction_Repeat_NLL": 0.15106079019606114,
+    "Passkey_Acc": 1.0,
+    "HumanEval_Pass@1": 45.0
+  },
+  "finetuned": {
+    "PPL_WikiText2": 18.02097128714616,
+    "PPL_MBPP": 15.660047458918315,
+    "Induction_Repeat_NLL": 0.15609926953911782,
+    "Passkey_Acc": 1.0,
+    "HumanEval_Pass@1": 55.0
+  }
+}

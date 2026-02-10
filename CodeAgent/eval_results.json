@@ -1,0 +1,16 @@
+{
+  "base": {
+    "PPL_WikiText": 64.59620666503906,
+    "PPL_Code": 1.8628566265106201,
+    "Induction_NLL": 0.12628469429910183,
+    "Passkey_Acc": 0.0,
+    "HumanEval_Pass@1": 100.0
+  },
+  "finetuned": {
+    "PPL_WikiText": 170.80563354492188,
+    "PPL_Code": 1.642107605934143,
+    "Induction_NLL": 0.13620206639170646,
+    "Passkey_Acc": 0.0,
+    "HumanEval_Pass@1": 95.0
+  }
+}
