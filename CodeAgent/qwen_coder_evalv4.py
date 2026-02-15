@@ -1,31 +1,38 @@
 #!/usr/bin/env python3
 """
-coder_eval_v3.py
+coder_eval_v4.py
 
-Adds:
-- HumanEval pass@1 (subset or full 164)
-- MBPP pass@1 (exec unit tests from dataset)
-Keeps:
-- PPL WikiText2 (sliding window)
-- PPL MBPP text (renamed to PPL_MBPP_Text for clarity)
-- Induction repeat-half NLL
-- Passkey retrieval (chat-template aligned, token-accurate)
+A comprehensive LLM Coder evaluation script that merges functionalities from
+qwen_coder_eval_v3.py and advanced_coder_eval.py.
+
+New Features:
+- Evaluates models from Hugging Face (HF), local folders, or OpenAI-compatible APIs.
+- Simple model specification via command line.
+- Evaluates models sequentially to conserve GPU memory.
+- Integrates advanced evaluations: EvalPlus, lm-eval-harness.
+- Provides a comprehensive, professional-grade evaluation for comparing different coder models.
+- Robust execution: Skips individual evaluations that fail and continues.
+- Markdown reporting: Generates a summary report in Markdown format.
+
+Evaluations included:
+- Perplexity (PPL) on WikiText2 and MBPP text (for local/HF models).
+- Induction NLL (repeat-half task) (for local/HF models).
+- Passkey retrieval accuracy (for local/HF models).
+- HumanEval pass@1 (from original script and from EvalPlus).
+- MBPP pass@1 (from original script and from EvalPlus).
+- lm-eval-harness for various coding and general-purpose benchmarks.
 
 SECURITY WARNING:
-This script executes model-generated code (HumanEval + MBPP). Run inside a sandbox/container.
+This script executes model-generated code. Run it in a sandboxed or containerized environment.
 
-Example:
-  python coder_eval_v3.py \
-    --base unsloth/Qwen2.5-Coder-14B-Instruct \
-    --fine ./qwen_coder_lora \
-    --humaneval_n 164 \
-    --mbpp_n 200 \
-    --out eval_results_v3.json \
-    --plot qwen_eval_comparison_v3.png
+Example Usage:
 
-Notes:
-- For trustworthy PPL, evaluate in bf16/fp16 (default). --use_4bit_for_eval makes PPL less reliable.
-- For pass@1 stability, decoding is deterministic (do_sample=False, temperature=0).
+# Evaluate a HF model, a local model, and an API model
+python CodeAgent/qwen_coder_evalv4.py \
+  --models "unsloth/Qwen2.5-Coder-14B-Instruct" "./qwen_coder_lora" "openai:gpt-4o" \
+  --run_all --make_figures \
+  --out_dir ./eval_results
+
 """
 
 import os
@@ -36,13 +43,16 @@ import time
 import random
 import argparse
 import subprocess
-from typing import Dict, Any, List, Tuple, Optional
+import shutil
+import re
+import tempfile
+from typing import Dict, Any, List, Tuple, Optional, Callable
+from dataclasses import dataclass
 
 import numpy as np
 import torch
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-
 
 # -----------------------------
 # Utilities
@@ -54,24 +64,103 @@ def set_seed(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-
 def now_ts() -> str:
     return time.strftime("%Y%m%d-%H%M%S")
 
-
 def is_bf16_supported() -> bool:
-    try:
-        from unsloth import is_bfloat16_supported
-        return bool(is_bfloat16_supported())
-    except Exception:
-        if not torch.cuda.is_available():
-            return False
-        major, _minor = torch.cuda.get_device_capability(0)
-        return major >= 8  # Ampere+
+    if not torch.cuda.is_available():
+        return False
+    major, _ = torch.cuda.get_device_capability(0)
+    return major >= 8
 
+def ensure_dir(p: str) -> str:
+    os.makedirs(p, exist_ok=True)
+    return p
+
+def which_or_raise(cmd: str, install_hint: str) -> str:
+    path = shutil.which(cmd)
+    if not path:
+        raise RuntimeError(f"Missing command `{cmd}`.\nInstall hint:\n{install_hint}")
+    return path
+
+def run_cmd(
+    cmd: List[str],
+    cwd: Optional[str] = None,
+    env: Optional[Dict[str, str]] = None,
+    tee_to: Optional[str] = None,
+    timeout: Optional[int] = None,
+) -> subprocess.CompletedProcess:
+    """Run subprocess, optionally tee stdout+stderr to file."""
+    print(f"\n>> {' '.join(cmd)}")
+    timeout = timeout or 3600  # Set a long default timeout
+    p = subprocess.run(
+        cmd,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=timeout,
+    )
+    if tee_to:
+        ensure_dir(os.path.dirname(tee_to))
+        with open(tee_to, "w", encoding="utf-8") as f:
+            f.write(p.stdout)
+    if p.returncode != 0:
+        print(f"[WARN] Command failed (code={p.returncode}): {' '.join(cmd)}")
+        print("====== STDOUT/STDERR ======")
+        print(p.stdout[-4000:])
+        print("===========================")
+    return p
 
 # -----------------------------
-# Model loading
+# Model Specification
+# -----------------------------
+@dataclass
+class ModelSpec:
+    name: str
+    path: str
+    type: str
+    api_base: Optional[str] = None
+    api_key_env: str = "OPENAI_API_KEY"
+    tokenizer_path: str = "unsloth/Qwen2.5-Coder-14B-Instruct"
+    is_local_api: bool = False
+
+def parse_model_spec(model_str: str, args: argparse.Namespace) -> ModelSpec:
+    """
+    Determines model type and creates a ModelSpec.
+    - openai:model_name -> API model
+    - /path/to/dir -> local model
+    - org/model -> HF model
+    """
+    if model_str.startswith("openai:"):
+        model_name = model_str.split(":", 1)[1]
+        is_local = bool(args.api_base and ("127.0.0.1" in args.api_base or "localhost" in args.api_base))
+        return ModelSpec(
+            name=model_name,
+            path=model_name,
+            type="api",
+            api_base=args.api_base,
+            api_key_env=args.api_key_env,
+            is_local_api=is_local,
+        )
+    elif os.path.isdir(model_str):
+        model_name = os.path.basename(model_str.rstrip('/'))
+        return ModelSpec(
+            name=model_name,
+            path=model_str,
+            type="local"
+        )
+    else: # Assume HF model
+        model_name = model_str.split("/")[-1]
+        return ModelSpec(
+            name=model_name,
+            path=model_str,
+            type="hf"
+        )
+
+# -----------------------------
+# Model Loading & Generation
 # -----------------------------
 def load_model_and_tokenizer(
     model_name_or_path: str,
@@ -79,13 +168,9 @@ def load_model_and_tokenizer(
     device: str = "cuda",
     use_4bit: bool = False,
 ) -> Tuple[torch.nn.Module, Any]:
-    """
-    Prefer Unsloth loader (works well with adapter folders).
-    Falls back to Transformers if needed.
-    """
+    """Loads a model and tokenizer, preferring Unsloth."""
     try:
         from unsloth import FastLanguageModel
-
         dtype = torch.bfloat16 if (device.startswith("cuda") and is_bf16_supported()) else torch.float16
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=model_name_or_path,
@@ -93,897 +178,576 @@ def load_model_and_tokenizer(
             dtype=dtype,
             load_in_4bit=use_4bit,
         )
-        try:
-            FastLanguageModel.for_inference(model)
-        except Exception:
-            pass
-
+        FastLanguageModel.for_inference(model)
         model.to(device)
         model.eval()
         return model, tokenizer
+    except ImportError:
+        print("[WARN] Unsloth not found. Falling back to standard Transformers.")
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        dtype = torch.bfloat16 if (device.startswith("cuda") and is_bf16_supported()) else torch.float16
+        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name_or_path,
+            torch_dtype=dtype,
+            device_map="auto" if device.startswith("cuda") else None,
+            trust_remote_code=True,
+        )
+        model.eval()
+        return model, tokenizer
 
-    except Exception as e:
-        print(f"[WARN] Unsloth load failed: {e}\nFalling back to Transformers...")
+def create_hf_generator(model, tokenizer, device, max_new_tokens, do_sample=False) -> Callable[[str], str]:
+    @torch.no_grad()
+    def generator(prompt_text: str) -> str:
+        inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
+        gen = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=0.0 if not do_sample else 0.2,
+            use_cache=True,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+        return tokenizer.decode(gen[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+    return generator
 
-    from transformers import AutoTokenizer, AutoModelForCausalLM
+def create_api_generator(model_spec: ModelSpec, max_new_tokens: int) -> Callable[[str], str]:
+    import openai
+    api_key = os.getenv(model_spec.api_key_env)
+    if not api_key:
+        if model_spec.is_local_api:
+            api_key = "none"  # Dummy key for local servers like llama.cpp
+        else:
+            raise ValueError(f"API key not found. Please set the {model_spec.api_key_env} environment variable.")
 
-    dtype = torch.bfloat16 if (device.startswith("cuda") and is_bf16_supported()) else torch.float16
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name_or_path,
-        torch_dtype=dtype,
-        device_map="auto" if device.startswith("cuda") else None,
-        trust_remote_code=True,
-    )
-    model.eval()
-    return model, tokenizer
+    client = openai.OpenAI(api_key=api_key, base_url=model_spec.api_base)
 
+    def generator(prompt_text: str) -> str:
+        if prompt_text.endswith("<|im_start|>assistant\n"):
+             prompt_text = prompt_text.removesuffix("<|im_start|>assistant\n")
+
+        response = client.chat.completions.create(
+            model=model_spec.path,
+            messages=[{"role": "user", "content": prompt_text}],
+            max_tokens=max_new_tokens,
+            temperature=0.0,
+            n=1,
+            stop=None,
+        )
+        return response.choices[0].message.content or ""
+    return generator
 
 # -----------------------------
-# Perplexity (sliding window)
+# Performance Benchmarking
+# -----------------------------
+def get_gpu_memory_usage(device: str = "cuda") -> float:
+    """Returns peak GPU memory usage in GB."""
+    if not torch.cuda.is_available():
+        return 0.0
+    # Gets the peak memory in bytes and converts to GB.
+    peak_mem_bytes = torch.cuda.max_memory_allocated(device)
+    return round(peak_mem_bytes / (1024**3), 2)
+
+@torch.no_grad()
+def benchmark_generation(model, tokenizer, args) -> Dict[str, float]:
+    """Measures token generation speed and memory usage for a model."""
+    if not args.device.startswith("cuda"):
+        print("[INFO] Skipping generation benchmark on non-GPU device.")
+        return {}
+
+    torch.cuda.reset_peak_memory_stats(args.device)
+    torch.cuda.empty_cache()
+
+    prompt = "def fib(n):"  # Simple prompt to start generation
+    inputs = tokenizer(prompt, return_tensors="pt").to(args.device)
+
+    # Warmup run
+    model.generate(**inputs, max_new_tokens=16, use_cache=True, pad_token_id=tokenizer.eos_token_id)
+    torch.cuda.synchronize()
+
+    start_time = time.time()
+    generated_ids = model.generate(**inputs, max_new_tokens=args.benchmark_max_new_tokens, use_cache=True, pad_token_id=tokenizer.eos_token_id)
+    torch.cuda.synchronize()
+    end_time = time.time()
+
+    num_new_tokens = generated_ids.shape[1] - inputs["input_ids"].shape[1]
+    duration = end_time - start_time
+    
+    tokens_per_sec = (num_new_tokens / duration) if duration > 0 else 0
+    peak_memory_gb = get_gpu_memory_usage(args.device)
+
+    return {
+        "tokens_per_sec": round(tokens_per_sec, 2),
+        "peak_memory_gb": peak_memory_gb,
+    }
+
+# -----------------------------
+# Evals
 # -----------------------------
 @torch.no_grad()
-def perplexity_sliding_window(
-    model,
-    tokenizer,
-    texts: List[str],
-    device: str,
-    max_length: int,
-    stride: int,
-) -> float:
+def perplexity_sliding_window(model, tokenizer, dataset_name: str, args: argparse.Namespace) -> float:
+    from datasets import load_dataset
+    split_map = {"wikitext": "test", "mbpp": "test"}
+    text_key_map = {"wikitext": "text", "mbpp": "prompt"}
+    dataset = load_dataset(dataset_name, "wikitext-2-raw-v1" if dataset_name == "wikitext" else "sanitized", split=split_map[dataset_name])
+    texts = [d[text_key_map[dataset_name]] for d in dataset if d[text_key_map[dataset_name]]]
+    
     model.eval()
-    total_nll = 0.0
-    total_tokens = 0
-
-    for text in tqdm(texts, desc="PPL"):
+    total_nll, total_tokens = 0.0, 0
+    for text in tqdm(texts, desc=f"PPL ({dataset_name})"):
         enc = tokenizer(text, return_tensors="pt", add_special_tokens=True)
-        input_ids = enc["input_ids"][0].to(device)
-
-        if input_ids.numel() < 2:
-            continue
-
-        for start in range(0, input_ids.numel(), stride):
-            end = min(start + max_length, input_ids.numel())
+        input_ids = enc["input_ids"][0].to(args.device)
+        if input_ids.numel() < 2: continue
+        for start in range(0, input_ids.numel(), args.ppl_stride):
+            end = min(start + args.ppl_max_len, input_ids.numel())
             window = input_ids[start:end]
-
             labels = window.clone()
             if start > 0:
-                overlap = max_length - stride
-                overlap = max(0, min(overlap, labels.numel()))
+                overlap = max(0, min(args.ppl_max_len - args.ppl_stride, labels.numel()))
                 labels[:overlap] = -100
-
             out = model(window.unsqueeze(0), labels=labels.unsqueeze(0))
             contrib = (labels != -100).sum().item()
             if contrib > 0:
                 total_nll += out.loss.item() * contrib
                 total_tokens += contrib
+            if end == input_ids.numel(): break
+    return float(math.exp(total_nll / total_tokens)) if total_tokens > 0 else float("inf")
 
-            if end == input_ids.numel():
-                break
-
-    if total_tokens == 0:
-        return float("inf")
-
-    return float(math.exp(total_nll / total_tokens))
-
-
-def sample_texts_from_dataset(ds, text_cols: List[str], n_samples: int, seed: int) -> List[str]:
-    rng = random.Random(seed)
-    idxs = list(range(len(ds)))
-    rng.shuffle(idxs)
-    idxs = idxs[: min(n_samples, len(idxs))]
-
-    texts: List[str] = []
-    for i in idxs:
-        ex = ds[i]
-        t = ""
-        for c in text_cols:
-            if c in ex and ex[c]:
-                t = ex[c]
-                break
-        if t:
-            texts.append(t)
-    return texts
-
-
-# -----------------------------
-# Induction NLL (repeat-half)
-# -----------------------------
 @torch.no_grad()
-def induction_repeat_nll(
-    model,
-    vocab_size: int,
-    seq_len: int,
-    n_samples: int,
-    device: str,
-) -> float:
+def induction_repeat_nll(model, tokenizer, args: argparse.Namespace) -> float:
     model.eval()
     nlls = []
-
-    hi = min(int(vocab_size), 50000)
-    lo = 1000 if hi > 2000 else 0
-
-    for _ in tqdm(range(n_samples), desc="Induction"):
-        A = torch.randint(low=lo, high=hi, size=(1, seq_len), device=device)
+    vocab_size = getattr(model.config, "vocab_size", 50257)
+    hi, lo = min(int(vocab_size), 50000), 1000
+    for _ in tqdm(range(args.induction_samples), desc="Induction"):
+        A = torch.randint(low=lo, high=hi, size=(1, args.induction_seq_len), device=args.device)
         inp = torch.cat([A, A], dim=1)
         labels = inp.clone()
-        labels[:, :seq_len] = -100
+        labels[:, :args.induction_seq_len] = -100
         out = model(inp, labels=labels)
         nlls.append(float(out.loss.item()))
-
     return float(np.mean(nlls)) if nlls else float("inf")
 
-
-# -----------------------------
-# Passkey retrieval (chat-aligned)
-# -----------------------------
 @torch.no_grad()
-def passkey_retrieval_acc(
-    model,
-    tokenizer,
-    context_tokens: int,
-    needle_depth: float,
-    n_trials: int,
-    device: str,
-    max_new_tokens: int = 64,
-    min_new_tokens: int = 4,
-    use_chat_template: bool = True,
-    debug_trials: int = 0,
-) -> float:
+def passkey_retrieval_acc(model, tokenizer, args: argparse.Namespace) -> float:
     model.eval()
     hits = 0
+    filler_ids = tokenizer.encode("The sun sets in the west. ", add_special_tokens=False)
 
-    filler_sentence = "The sun sets in the west. "
-    filler_ids = tokenizer.encode(filler_sentence, add_special_tokens=False)
-
-    for t in tqdm(range(n_trials), desc="Passkey"):
+    for _ in tqdm(range(args.passkey_trials), desc="Passkey"):
         passkey = random.randint(10000, 99999)
         needle = f"\nThe secret passkey is {passkey}.\n"
-        needle_ids = tokenizer.encode(needle, add_special_tokens=False)
-
+        budget = args.passkey_ctx - (len(tokenizer.encode(needle)) + 80)
+        filler = (filler_ids * (budget // len(filler_ids) + 1))[:budget]
+        
+        insert_at = int(len(filler) * args.passkey_depth)
+        ctx_text = tokenizer.decode(filler[:insert_at] + tokenizer.encode(needle) + filler[insert_at:])
         question = "\nWhat is the secret passkey? Answer with ONLY the number."
-        q_ids = tokenizer.encode(question, add_special_tokens=False)
-
-        budget = context_tokens - (len(needle_ids) + len(q_ids) + 16)
-        budget = max(budget, 256)
-        reps = max(1, budget // max(1, len(filler_ids)))
-        filler = (filler_ids * reps)[:budget]
-
-        insert_at = int(len(filler) * needle_depth)
-        full_ctx_ids = filler[:insert_at] + needle_ids + filler[insert_at:]
-        ctx_text = tokenizer.decode(full_ctx_ids, skip_special_tokens=True)
-
-        if use_chat_template and hasattr(tokenizer, "apply_chat_template"):
-            messages = [{"role": "user", "content": ctx_text + question}]
-            prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
-            prompt_len = inputs["input_ids"].shape[1]
-            gen = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                min_new_tokens=min_new_tokens,
-                do_sample=False,
-                temperature=0.0,
-                use_cache=True,
-                pad_token_id=getattr(tokenizer, "eos_token_id", None),
-            )
-            out_ids = gen[0, prompt_len:].tolist()
-        else:
-            prompt_ids = torch.tensor([full_ctx_ids + q_ids], device=device)
-            gen = model.generate(
-                input_ids=prompt_ids,
-                max_new_tokens=max_new_tokens,
-                min_new_tokens=min_new_tokens,
-                do_sample=False,
-                temperature=0.0,
-                use_cache=True,
-                pad_token_id=getattr(tokenizer, "eos_token_id", None),
-            )
-            out_ids = gen[0, prompt_ids.shape[1]:].tolist()
-
-        out_txt = tokenizer.decode(out_ids, skip_special_tokens=True)
-
-        digits = "".join([ch if ch.isdigit() else " " for ch in out_txt]).split()
-        pred = digits[0] if digits else ""
-
-        if t < debug_trials:
-            print(f"[DEBUG] GT={passkey} pred={pred} raw={repr(out_txt[:200])}")
-
-        if pred == str(passkey):
+        
+        messages = [{"role": "user", "content": ctx_text + question}]
+        prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = tokenizer(prompt_text, return_tensors="pt").to(args.device)
+        
+        gen = model.generate(**inputs, max_new_tokens=64, do_sample=False, pad_token_id=tokenizer.eos_token_id)
+        out_txt = tokenizer.decode(gen[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        
+        if str(passkey) in "".join(filter(str.isdigit, out_txt)):
             hits += 1
+            
+    return float(hits / args.passkey_trials) if args.passkey_trials > 0 else 0.0
 
-    return float(hits / n_trials) if n_trials > 0 else 0.0
-
-
-# -----------------------------
-# Code extraction + execution
-# -----------------------------
 def extract_code_from_generation(gen_text: str) -> str:
-    t = gen_text
-    if "```python" in t:
-        t = t.split("```python", 1)[1].split("```", 1)[0]
-        return t.strip()
-    if "```" in t:
-        t = t.split("```", 1)[1].split("```", 1)[0]
-        return t.strip()
-    return t.strip()
-
-
-# def run_code_subprocess(code: str, timeout_s: float = 8.0) -> bool:
-#     """
-#     Execute code in a subprocess. Still unsafe; use sandbox.
-#     Returns True if prints SUCCESS and no FAILURE.
-#     """
-#     wrapper = (
-#         "import sys\n"
-#         "try:\n"
-#         + "\n".join("    " + line for line in code.splitlines())
-#         + "\n    print('SUCCESS')\n"
-#         "except Exception as e:\n"
-#         "    print('FAILURE')\n"
-#     )
-#     try:
-#         res = subprocess.run(
-#             [sys.executable, "-c", wrapper],
-#             capture_output=True,
-#             text=True,
-#             timeout=timeout_s,
-#         )
-#         return ("SUCCESS" in res.stdout) and ("FAILURE" not in res.stdout)
-#     except subprocess.TimeoutExpired:
-#         return False
-#     except Exception:
-#         return False
-import tempfile
-import textwrap
-import subprocess
-import sys
-import os
+    if "```python" in gen_text:
+        return gen_text.split("```python", 1)[1].split("```", 1)[0].strip()
+    if "```" in gen_text:
+        return gen_text.split("```", 1)[1].split("```", 1)[0].strip()
+    return gen_text.strip()
 
 def run_code_subprocess(code: str, timeout_s: float = 10.0) -> bool:
-    """
-    Run code by writing it to a temporary .py file and executing it.
-    This avoids indentation corruption from the previous wrapper approach.
-    Returns True if exit code == 0.
-    """
     with tempfile.TemporaryDirectory() as td:
         path = os.path.join(td, "prog.py")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(code)
-            f.write("\n")
+        with open(path, "w", encoding="utf-8") as f: f.write(code)
         try:
-            res = subprocess.run(
-                [sys.executable, path],
-                capture_output=True,
-                text=True,
-                timeout=timeout_s,
-            )
+            res = subprocess.run([sys.executable, path], capture_output=True, text=True, timeout=timeout_s)
             return res.returncode == 0
-        except subprocess.TimeoutExpired:
-            return False
-        except Exception:
+        except (subprocess.TimeoutExpired, Exception):
             return False
 
-# -----------------------------
-# HumanEval pass@1
-# -----------------------------
-@torch.no_grad()
-def humaneval_pass_at_1(
-    model,
-    tokenizer,
-    n_problems: int,
-    device: str,
-    max_new_tokens: int = 512,
-) -> float:
+def humaneval_pass_at_1(generator_fn: Callable, tokenizer: Any, n: int) -> float:
     from datasets import load_dataset
     ds = load_dataset("openai_humaneval", split="test")
-    n = min(n_problems, len(ds))
+    n = min(n, len(ds))
     ds = ds.select(range(n))
-
     passed = 0
-
     for ex in tqdm(ds, desc="HumanEval"):
-        prompt = ex["prompt"]
-        test_code = ex["test"]
-        entry_point = ex["entry_point"]
-
-        # Chat prompt
-        if hasattr(tokenizer, "apply_chat_template"):
-            messages = [{"role": "user", "content": f"Complete the following Python function.\nReturn only code.\n\n{prompt}"}]
-            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        else:
-            text = f"Complete the following Python function. Return only code.\n\n{prompt}\n"
-
-        inputs = tokenizer(text, return_tensors="pt").to(device)
-
-        gen = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            temperature=0.0,
-            use_cache=True,
-            pad_token_id=getattr(tokenizer, "eos_token_id", None),
-        )
-
-        gen_text = tokenizer.decode(gen[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        messages = [{"role": "user", "content": f"Complete the following Python function.\nReturn only code.\n\n{ex['prompt']}"}]
+        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        gen_text = generator_fn(text)
         code_pred = extract_code_from_generation(gen_text)
+        full_code = f"import math\nfrom typing import *\n\n{ex['prompt']}{code_pred}\n\n{ex['test']}\n\ncheck({ex['entry_point']})\n"
+        if run_code_subprocess(full_code): passed += 1
+    return (100.0 * passed / n) if n > 0 else 0.0
 
-        full = (
-            "import math\n"
-            "from typing import *\n\n"
-            f"{prompt}\n"
-            f"{code_pred}\n\n"
-            f"{test_code}\n\n"
-            f"check({entry_point})\n"
-        )
-
-        if run_code_subprocess(full, timeout_s=10.0):
-            passed += 1
-
-    return float(100.0 * passed / n) if n > 0 else 0.0
-
-
-# # -----------------------------
-# # MBPP pass@1
-# # -----------------------------
-# @torch.no_grad()
-# def mbpp_pass_at_1(
-#     model,
-#     tokenizer,
-#     n_problems: int,
-#     device: str,
-#     max_new_tokens: int = 512,
-# ) -> float:
-#     """
-#     Evaluates MBPP by generating a function solution and running MBPP's tests.
-
-#     Dataset: "mbpp", split="test"
-#     Fields typically include:
-#       - "text": problem statement
-#       - "code": reference solution (not used)
-#       - "test_list": list of assert statements (strings)
-#       - "task_id": identifier
-
-#     We prompt the model to write Python code only.
-#     We then run:
-#       - model code
-#       - each assert in test_list
-
-#     This is still a simplified harness.
-#     """
-#     from datasets import load_dataset
-#     ds = load_dataset("mbpp", split="test")
-#     n = min(n_problems, len(ds))
-#     ds = ds.select(range(n))
-
-#     passed = 0
-
-#     for ex in tqdm(ds, desc="MBPP"):
-#         text = ex.get("text", "")
-#         tests = ex.get("test_list", []) or []
-
-#         # Build prompt; MBPP does not provide entry_point reliably, so we just ask for code.
-#         user_prompt = (
-#             "Write a correct Python solution.\n"
-#             "Return ONLY Python code (no explanations).\n\n"
-#             f"Problem:\n{text}\n"
-#         )
-
-#         if hasattr(tokenizer, "apply_chat_template"):
-#             messages = [{"role": "user", "content": user_prompt}]
-#             prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-#         else:
-#             prompt = user_prompt
-
-#         inputs = tokenizer(prompt, return_tensors="pt").to(device)
-
-#         gen = model.generate(
-#             **inputs,
-#             max_new_tokens=max_new_tokens,
-#             do_sample=False,
-#             temperature=0.0,
-#             use_cache=True,
-#             pad_token_id=getattr(tokenizer, "eos_token_id", None),
-#         )
-
-#         gen_text = tokenizer.decode(gen[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-#         code_pred = extract_code_from_generation(gen_text)
-
-#         # Assemble runnable script
-#         # Put tests after code; tests are usually assert statements.
-#         test_block = "\n".join(tests)
-#         full = (
-#             "import math\n"
-#             "from typing import *\n\n"
-#             f"{code_pred}\n\n"
-#             f"{test_block}\n"
-#         )
-
-#         if run_code_subprocess(full, timeout_s=10.0):
-#             passed += 1
-
-#     return float(100.0 * passed / n) if n > 0 else 0.0
-
-# -----------------------------
-# MBPP pass@1 (FIXED)
-# -----------------------------
-# -----------------------------
-# MBPP pass@1 (UPGRADED)
-# -----------------------------
-def run_code_subprocess_verbose(code: str, timeout_s: float = 10.0):
-    import tempfile, os, subprocess, sys
-    with tempfile.TemporaryDirectory() as td:
-        path = os.path.join(td, "prog.py")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(code)
-            f.write("\n")
-        try:
-            res = subprocess.run(
-                [sys.executable, path],
-                capture_output=True,
-                text=True,
-                timeout=timeout_s,
-            )
-            return (res.returncode == 0, res.stdout, res.stderr)
-        except subprocess.TimeoutExpired:
-            return (False, "", "TIMEOUT")
-        except Exception as e:
-            return (False, "", f"EXCEPTION: {e}")
-        
-@torch.no_grad()
-def mbpp_pass_at_1(
-    model,
-    tokenizer,
-    n_problems: int,
-    device: str,
-    max_new_tokens: int = 512,
-    timeout_s: float = 10.0,
-    debug_n: int = 3,                  # print first N failures
-    failures_jsonl: str = "",          # optional: save failures for inspection
-    tests_in_prompt: int = 5,          # include first K asserts in prompt (recommend 3-10)
-    retry_on_fail: bool = True,        # do one extra attempt with error feedback
-) -> float:
-    """
-    MBPP pass@1 with:
-      - safe execution (file-based runner recommended)
-      - entry-point inference primarily from asserts
-      - prompt includes MBPP tests (reduces I/O mismatches)
-      - records stderr tail for debugging / analysis
-      - optional 1 retry with error feedback
-
-    Requires:
-      - extract_code_from_generation
-      - run_code_subprocess_verbose (recommended) OR run_code_subprocess + a wrapper below
-    """
-    import re
-    import json
+def mbpp_pass_at_1(generator_fn: Callable, tokenizer: Any, n: int) -> float:
     from datasets import load_dataset
-
-    # ---------- helpers ----------
-    def infer_entry_point(problem_text: str, tests: List[str]) -> str:
-        joined = "\n".join(tests)
-        # Most reliable: assert foo(...)
-        m = re.search(r"assert\s+([A-Za-z_]\w*)\s*\(", joined)
-        if m:
-            return m.group(1)
-
-        # fallback from problem statement
-        m = re.search(r"\bfunction\s+([A-Za-z_]\w*)\b", problem_text)
-        if m:
-            return m.group(1)
-        m = re.search(r"\bnamed\s+([A-Za-z_]\w*)\b", problem_text)
-        if m:
-            return m.group(1)
-        return ""
-
-    def build_prompt(problem_text: str, entry_point: str, tests: List[str], extra_feedback: str = "") -> str:
-        # include a few tests to enforce I/O + exact output format
-        tblock = ""
-        if tests:
-            tblock = "\n".join(tests[:max(0, int(tests_in_prompt))])
-        if entry_point:
-            base = (
-                "Return ONLY valid Python code. No markdown fences. No explanation.\n"
-                f"You MUST implement a function named `{entry_point}` exactly.\n"
-                "Do not change the function name.\n"
-                "You may define helper functions if needed.\n"
-                "Do not include any tests or main code.\n\n"
-                f"Problem:\n{problem_text}\n\n"
-            )
-        else:
-            base = (
-                "Return ONLY valid Python code. No markdown fences. No explanation.\n"
-                "You may define helper functions if needed.\n"
-                "Do not include any tests or main code.\n\n"
-                f"Problem:\n{problem_text}\n\n"
-            )
-
-        if tblock:
-            base += "Your solution MUST satisfy these tests:\n" + tblock + "\n\n"
-
-        if extra_feedback:
-            base += "Previous attempt failed with:\n" + extra_feedback.strip() + "\n\n"
-
-        base += "Now output ONLY the Python code:\n"
-        return base
-
-    def generate_code(user_prompt: str) -> str:
-        if hasattr(tokenizer, "apply_chat_template"):
-            messages = [{"role": "user", "content": user_prompt}]
-            prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        else:
-            prompt = user_prompt
-
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
-        gen = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            temperature=0.0,
-            use_cache=True,
-            pad_token_id=getattr(tokenizer, "eos_token_id", None),
-        )
-        gen_text = tokenizer.decode(gen[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-        return extract_code_from_generation(gen_text)
-
-    # If you already replaced run_code_subprocess with file-based version, keep it.
-    # But to capture errors we want a verbose runner.
-    def run_verbose(code: str, timeout_s: float):
-        """
-        Uses run_code_subprocess_verbose if available; otherwise falls back to run_code_subprocess.
-        Returns: ok(bool), stdout(str), stderr(str)
-        """
-        if "run_code_subprocess_verbose" in globals():
-            return run_code_subprocess_verbose(code, timeout_s=timeout_s)
-        # fallback (no stderr)
-        ok = run_code_subprocess(code, timeout_s=timeout_s)
-        return ok, "", "(no stderr captured; define run_code_subprocess_verbose to see errors)"
-
-    # Richer prelude to reduce import-related failures
-    prelude = (
-        "import math\n"
-        "import re\n"
-        "import string\n"
-        "import itertools\n"
-        "import functools\n"
-        "import collections\n"
-        "import statistics\n"
-        "from typing import *\n\n"
-    )
-
-    # ---------- load dataset ----------
-    ds = load_dataset("mbpp", split="test")
-    n = min(n_problems, len(ds))
+    ds = load_dataset("mbpp", "sanitized", split="test")
+    n = min(n, len(ds))
     ds = ds.select(range(n))
-
     passed = 0
-    failures = []
-    shown = 0
-
     for ex in tqdm(ds, desc="MBPP"):
-        problem = ex.get("text", "") or ""
-        tests = ex.get("test_list", []) or []
-        task_id = ex.get("task_id", None)
+        user_prompt = f"Write a Python function to solve the following problem.\nReturn only code.\n\n{ex['prompt']}"
+        messages = [{"role": "user", "content": user_prompt}]
+        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        gen_text = generator_fn(text)
+        code_pred = extract_code_from_generation(gen_text)
+        full_code = f"import math\nfrom typing import *\n\n{code_pred}\n\n" + "\n".join(ex["test_list"])
+        if run_code_subprocess(full_code): passed += 1
+    return (100.0 * passed / n) if n > 0 else 0.0
 
-        entry = infer_entry_point(problem, tests)
-        test_block = "\n".join(tests)
+def run_evalplus(spec: ModelSpec, dataset: str, parallel: int, out_dir: str) -> Dict:
+    log_path = os.path.join(out_dir, f"evalplus_{spec.name.replace('/', '_')}_{dataset}.log")
+    cmd = ["evalplus.evaluate", "--dataset", dataset, "--greedy"]
+    if spec.type == "api":
+        cmd.extend(["--model", spec.path, "--backend", "oai"])
+        if spec.api_base: cmd.extend(["--base-url", spec.api_base])
+    else:
+        cmd.extend(["--model", spec.path, "--backend", "hf"])
+    if parallel > 0: cmd.extend(["--parallel", str(parallel)])
+    
+    env = os.environ.copy()
+    if spec.is_local_api and "OPENAI_API_KEY" not in env:
+        env["OPENAI_API_KEY"] = "none"
+        
+    p = run_cmd(cmd, tee_to=log_path, env=env)
+    if p.returncode != 0: return {"pass@1": "failed", "log": log_path}
+    
+    m = re.search(r"pass@1\s*:\s*([0-9.]+)", p.stdout)
+    return {"pass@1": float(m.group(1)) * 100.0 if m else 0.0, "log": log_path}
 
-        # --- Attempt 1 ---
-        prompt1 = build_prompt(problem, entry, tests)
-        code1 = generate_code(prompt1)
-        full1 = f"{prelude}{code1}\n\n{test_block}\n"
-        ok1, out1, err1 = run_verbose(full1, timeout_s=timeout_s)
+def run_lm_eval(spec: ModelSpec, tasks: str, bs: int, dev: str, out_dir: str) -> Dict:
+    out_json_path = os.path.join(out_dir, f"lm_eval_{spec.name.replace('/', '_')}.json")
+    log_path = out_json_path.replace(".json", ".log")
+    
+    cmd = ["lm_eval", "--tasks", tasks, "--output_path", out_json_path, "--confirm_run_unsafe_code"]
+    
+    if spec.type == "api":
+        if spec.is_local_api:
+            # Use local-completions for local API endpoints, as they are often not chat-tuned
+            # and might be served by tools like llama.cpp or vLLM at a completion endpoint.
+            model_args_parts = [f"model={spec.path}", "num_concurrent=16"]
+            if spec.api_base:
+                # lm-eval's local-completions wants the full completions URL. This handles
+                # base URLs with or without a trailing /v1.
+                api_base = spec.api_base.strip('/')
+                if api_base.endswith('/v1'):
+                    completions_url = api_base + "/completions"
+                else:
+                    completions_url = api_base + "/v1/completions"
+                model_args_parts.append(f"base_url={completions_url}")
+            
+            cmd.extend([
+                "--model", "local-completions",
+                "--model_args", ",".join(model_args_parts),
+                "--batch_size", str(bs)
+            ])
+        else:
+            model_args_parts = [f"model={spec.path}"]
+            if spec.api_base:
+                model_args_parts.append(f"base_url={spec.api_base}")
+            cmd.extend(["--model", "openai", "--model_args", ",".join(model_args_parts)])
+    else:
+        cmd.extend(["--model", "hf", "--model_args", f"pretrained={spec.path}", "--device", dev, "--batch_size", str(bs)])
+    
+    env = os.environ.copy()
+    env["LM_EVAL_ALLOW_CODE_EXECUTION"] = "1"
+    env["HF_ALLOW_CODE_EVAL"] = "1"
+    if spec.is_local_api and "OPENAI_API_KEY" not in env:
+        env["OPENAI_API_KEY"] = "none"
 
-        if ok1:
-            passed += 1
-            continue
+    p = run_cmd(cmd, tee_to=log_path, env=env)
+    
+    if p.returncode != 0:
+        print(f"[WARN] lm-eval command failed. Trying to parse from stdout. See log: {log_path}")
+    
+    # Try parsing from file first
+    if os.path.exists(out_json_path):
+        with open(out_json_path) as f:
+            try:
+                return json.load(f).get("results", {})
+            except json.JSONDecodeError:
+                print(f"[WARN] Could not parse lm-eval JSON from file {out_json_path}.")
 
-        # --- Attempt 2 (optional retry with feedback) ---
-        ok2 = False
-        code2 = ""
-        err2 = ""
-        if retry_on_fail:
-            # include tail of stderr (common cases: AssertionError/TypeError/NameError)
-            feedback = (err1 or "").strip()
-            feedback_tail = feedback[-1200:] if feedback else ""
-            # also include first test to focus
-            first_test = tests[0] if tests else ""
-            extra = ""
-            if first_test:
-                extra += f"First failing test (at least):\n{first_test}\n\n"
-            if feedback_tail:
-                extra += f"Error output:\n{feedback_tail}\n"
+    # Fallback to stdout
+    try:
+        json_start = p.stdout.find('{')
+        if json_start != -1:
+            json_str = p.stdout[json_start:]
+            # The stdout might contain more than just the JSON, so we need to find the end of it.
+            brace_count = 0
+            end_pos = -1
+            for i, char in enumerate(json_str):
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                if brace_count == 0:
+                    end_pos = i + 1
+                    break
+            if end_pos != -1:
+                json_str = json_str[:end_pos]
 
-            prompt2 = build_prompt(problem, entry, tests, extra_feedback=extra)
-            code2 = generate_code(prompt2)
-            full2 = f"{prelude}{code2}\n\n{test_block}\n"
-            ok2, out2, err2 = run_verbose(full2, timeout_s=timeout_s)
+            results = json.loads(json_str)
+            with open(out_json_path, "w") as f:
+                json.dump(results, f, indent=2)
+            return results.get("results", {})
+    except (json.JSONDecodeError, IndexError):
+        print(f"[WARN] Could not parse lm-eval JSON output from stdout for {spec.name}.")
 
-            if ok2:
-                passed += 1
-                continue
-
-        # record failure
-        if failures_jsonl:
-            failures.append({
-                "task_id": task_id,
-                "entry_point": entry,
-                "problem": problem,
-                "tests": tests,
-                "attempt1": {
-                    "code_head": code1[:800],
-                    "stderr_tail": (err1 or "")[-2000:],
-                },
-                "attempt2": {
-                    "enabled": bool(retry_on_fail),
-                    "code_head": code2[:800] if code2 else "",
-                    "stderr_tail": (err2 or "")[-2000:] if err2 else "",
-                },
-            })
-
-        if debug_n and shown < debug_n:
-            shown += 1
-            print("\n[MBPP FAIL]")
-            print("task_id:", task_id, "entry_point:", entry)
-            print("problem:", problem[:260])
-            print("first_test:", tests[0] if tests else "<none>")
-            print("code_pred_head:", code1[:260])
-            if err1:
-                print("stderr_tail:", err1[-600:])
-
-    if failures_jsonl and failures:
-        with open(failures_jsonl, "w", encoding="utf-8") as f:
-            for row in failures:
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-    return float(100.0 * passed / n) if n > 0 else 0.0
-
-
-# -----------------------------
-# Plotting
-# -----------------------------
-def plot_comparison(base: Dict[str, float], fine: Dict[str, float], save_path: str):
-    keys = [k for k in base.keys() if k in fine.keys()]
-    if not keys:
-        print("[WARN] No overlapping metrics to plot.")
-        return
-
-    order = [
-        "HumanEval_Pass@1",
-        "MBPP_Pass@1",
-        "Induction_Repeat_NLL",
-        "PPL_MBPP_Text",
-        "PPL_WikiText2",
-        "Passkey_Acc",
-    ]
-    keys_sorted = [k for k in order if k in keys] + [k for k in sorted(keys) if k not in order]
-
-    fig_w = min(5 * len(keys_sorted), 26)
-    fig, axes = plt.subplots(1, len(keys_sorted), figsize=(fig_w, 5))
-    if len(keys_sorted) == 1:
-        axes = [axes]
-
-    for ax, k in zip(axes, keys_sorted):
-        ax.bar(["Base", "Finetuned"], [base[k], fine[k]])
-        ax.set_title(k.replace("_", " "))
-        for i, v in enumerate([base[k], fine[k]]):
-            ax.text(i, v, f"{v:.3f}", ha="center", va="bottom")
-        ax.grid(axis="y", linestyle="--", alpha=0.4)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=200)
-    print(f"[OK] Saved plot to: {save_path}")
-
+    return {}
 
 # -----------------------------
-# Evaluation wrapper
+# Reporting
 # -----------------------------
-def evaluate_one(
-    model_name_or_path: str,
-    device: str,
-    max_seq_length: int,
-    ppl_max_len: int,
-    ppl_stride: int,
-    ppl_samples: int,
-    induction_seq_len: int,
-    induction_samples: int,
-    passkey_ctx: int,
-    passkey_depth: float,
-    passkey_trials: int,
-    humaneval_n: int,
-    humaneval_max_new_tokens: int,
-    mbpp_n: int,
-    mbpp_max_new_tokens: int,
-    use_4bit_for_eval: bool,
-    seed: int,
-) -> Dict[str, float]:
-    set_seed(seed)
+def plot_results(all_results: Dict[str, Dict], out_dir: str):
+    if not all_results: return
+    model_names = list(all_results.keys())
+    metric_keys = sorted({k for res in all_results.values() for k, v in res.items() if isinstance(v, (int, float))})
+    if not metric_keys: return
 
-    model, tokenizer = load_model_and_tokenizer(
-        model_name_or_path=model_name_or_path,
-        max_seq_length=max_seq_length,
-        device=device,
-        use_4bit=use_4bit_for_eval,
-    )
+    fig, axes = plt.subplots(1, len(metric_keys), figsize=(4 * len(metric_keys), 6), squeeze=False)
+    for i, key in enumerate(metric_keys):
+        ax = axes[0, i]
+        values = [all_results[name].get(key, 0) for name in model_names]
+        ax.bar(model_names, values)
+        ax.set_title(key.replace("_", " "), fontsize=10)
+        ax.set_xticklabels(model_names, rotation=60, ha="right")
+        for j, v in enumerate(values): ax.text(j, v, f"{v:.2f}", ha="center", va="bottom")
+        ax.grid(axis="y", linestyle="--", alpha=0.5)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "comparison_summary.png"), dpi=200)
+    print(f"\n[OK] Saved summary plot to: {os.path.join(out_dir, 'comparison_summary.png')}")
 
-    from datasets import load_dataset
+def generate_markdown_report(all_results: Dict[str, Dict], out_dir: str):
+    if not all_results: return
+    model_names, metric_keys = list(all_results.keys()), sorted({k for res in all_results.values() for k in res})
+    
+    md = ["# Evaluation Report\n"]
+    md.append("| Model | " + " | ".join(metric_keys) + " |")
+    md.append("|:---| " + " | ".join([":---:"] * len(metric_keys)) + " |")
+    for name in model_names:
+        row = [f"| {name} "]
+        for key in metric_keys:
+            val = all_results[name].get(key, "N/A")
+            row.append(f" {val:.2f} " if isinstance(val, float) else f" {val} ")
+        md.append(" | ".join(row) + " |")
+    
+    with open(os.path.join(out_dir, "report.md"), "w") as f: f.write("\n".join(md))
+    print(f"[OK] Saved Markdown report to: {os.path.join(out_dir, 'report.md')}")
 
-    results: Dict[str, float] = {}
+# -----------------------------
+# Main Loop
+# -----------------------------
+def evaluate_model(spec: ModelSpec, args: argparse.Namespace) -> Dict[str, Any]:
+    print(f"\n{'='*20} Evaluating: {spec.name} ({spec.path}) {'='*20}")
 
-    # PPL WikiText2
-    wt2 = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-    wt_texts = sample_texts_from_dataset(wt2, ["text"], ppl_samples, seed=seed + 1)
-    results["PPL_WikiText2"] = perplexity_sliding_window(
-        model, tokenizer, wt_texts, device=device, max_length=ppl_max_len, stride=ppl_stride
-    )
+    original_no_proxy = os.environ.get('NO_PROXY')
+    original_lower_no_proxy = os.environ.get('no_proxy')
+    if spec.is_local_api:
+        # Append localhost to NO_PROXY to bypass proxy for local server,
+        # without breaking connections to the outside world (e.g., huggingface.co)
+        no_proxy_parts = original_no_proxy.split(',') if original_no_proxy else []
+        if '127.0.0.1' not in no_proxy_parts:
+            no_proxy_parts.append('127.0.0.1')
+        if 'localhost' not in no_proxy_parts:
+            no_proxy_parts.append('localhost')
+        new_no_proxy = ','.join(no_proxy_parts)
+        os.environ['NO_PROXY'] = new_no_proxy
+        os.environ['no_proxy'] = new_no_proxy
+        print(f"[INFO] Temporarily setting NO_PROXY/no_proxy='{new_no_proxy}' for local API evaluation.")
 
-    # PPL on MBPP text (clarity: it's the text prompt, not solve rate)
-    mbpp = load_dataset("mbpp", split="test")
-    mbpp_texts = sample_texts_from_dataset(mbpp, ["text"], ppl_samples, seed=seed + 2)
-    results["PPL_MBPP_Text"] = perplexity_sliding_window(
-        model, tokenizer, mbpp_texts, device=device, max_length=ppl_max_len, stride=ppl_stride
-    )
+    try:
+        results: Dict[str, Any] = {}
 
-    # Induction
-    vocab_size = int(getattr(getattr(model, "config", None), "vocab_size", 100000))
-    results["Induction_Repeat_NLL"] = induction_repeat_nll(
-        model=model,
-        vocab_size=vocab_size,
-        seq_len=induction_seq_len,
-        n_samples=induction_samples,
-        device=device,
-    )
+        try:
+            from transformers import AutoTokenizer
+            prompt_tokenizer = AutoTokenizer.from_pretrained(spec.tokenizer_path, trust_remote_code=True)
+        except Exception as e:
+            print(f"[ERROR] Failed to load tokenizer for {spec.name}: {e}"); return {"error": "Tokenizer loading failed"}
 
-    # Passkey
-    results["Passkey_Acc"] = passkey_retrieval_acc(
-        model=model,
-        tokenizer=tokenizer,
-        context_tokens=passkey_ctx,
-        needle_depth=passkey_depth,
-        n_trials=passkey_trials,
-        device=device,
-        use_chat_template=True,
-    )
+        gen_fn: Optional[Callable] = None
+        model: Optional[torch.nn.Module] = None
 
-    # HumanEval
-    results["HumanEval_Pass@1"] = humaneval_pass_at_1(
-        model=model,
-        tokenizer=tokenizer,
-        n_problems=humaneval_n,
-        device=device,
-        max_new_tokens=humaneval_max_new_tokens,
-    )
+        if spec.type in ["hf", "local"]:
+            try:
+                model, tok = load_model_and_tokenizer(spec.path, args.max_seq_length, args.device, args.use_4bit_for_eval)
+                prompt_tokenizer = tok
+                gen_fn = create_hf_generator(model, tok, args.device, args.humaneval_max_new_tokens)
+            except Exception as e:
+                print(f"[ERROR] Failed to load model {spec.name}: {e}")
+                results["model_loading"] = "failed"
+        elif spec.type == "api":
+            try:
+                gen_fn = create_api_generator(spec, args.humaneval_max_new_tokens)
+            except Exception as e:
+                print(f"[ERROR] Failed to create API generator for {spec.name}: {e}")
+                results["generator_creation"] = "failed"
 
-    # MBPP solve rate
-    results["MBPP_Pass@1"] = mbpp_pass_at_1(
-        model=model,
-        tokenizer=tokenizer,
-        n_problems=mbpp_n,
-        device=device,
-        max_new_tokens=mbpp_max_new_tokens,
-    )
+        if model:
+            if args.run_ppl:
+                try:
+                    results["PPL_WikiText"] = perplexity_sliding_window(model, prompt_tokenizer, "wikitext", args)
+                    results["PPL_MBPP"] = perplexity_sliding_window(model, prompt_tokenizer, "mbpp", args)
+                except Exception as e:
+                    print(f"[WARN] PPL evaluation failed for {spec.name}: {e}")
+                    results["PPL"] = "failed"
+            if args.run_induction:
+                try:
+                    results["Induction_NLL"] = induction_repeat_nll(model, prompt_tokenizer, args)
+                except Exception as e:
+                    print(f"[WARN] Induction evaluation failed for {spec.name}: {e}")
+                    results["Induction_NLL"] = "failed"
+            if args.run_passkey:
+                try:
+                    results["Passkey_Acc"] = passkey_retrieval_acc(model, prompt_tokenizer, args)
+                except Exception as e:
+                    print(f"[WARN] Passkey evaluation failed for {spec.name}: {e}")
+                    results["Passkey_Acc"] = "failed"
+            del model
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
 
-    # cleanup
-    del model, tokenizer
-    if device.startswith("cuda"):
-        torch.cuda.empty_cache()
+        if not gen_fn:
+            print(f"[WARN] No generator for {spec.name}, skipping code-gen evals.")
+            return results
 
-    return results
+        if args.run_humaneval:
+            try:
+                results["HumanEval_pass@1"] = humaneval_pass_at_1(gen_fn, prompt_tokenizer, args.humaneval_n)
+            except Exception as e:
+                print(f"[WARN] HumanEval pass@1 failed for {spec.name}: {e}")
+                results["HumanEval_pass@1"] = "failed"
+        if args.run_mbpp:
+            try:
+                results["MBPP_pass@1"] = mbpp_pass_at_1(gen_fn, prompt_tokenizer, args.mbpp_n)
+            except Exception as e:
+                print(f"[WARN] MBPP pass@1 failed for {spec.name}: {e}")
+                results["MBPP_pass@1"] = "failed"
 
+        raw_out_dir = ensure_dir(os.path.join(args.out_dir, "raw_outputs"))
+        if args.run_evalplus:
+            try:
+                results["EvalPlus_HumanEval"] = run_evalplus(spec, "humaneval", args.evalplus_parallel, raw_out_dir).get("pass@1")
+                results["EvalPlus_MBPP"] = run_evalplus(spec, "mbpp", args.evalplus_parallel, raw_out_dir).get("pass@1")
+            except Exception as e:
+                print(f"[WARN] EvalPlus failed for {spec.name}: {e}")
+                results["EvalPlus"] = "failed"
+                
+        if args.run_lm_eval:
+            try:
+                lm_res = run_lm_eval(spec, args.lm_eval_tasks, args.lm_eval_batch_size, args.device, raw_out_dir)
+                for task, res in lm_res.items():
+                    metric = next((v for k, v in res.items() if "acc" in k or "pass" in k), None)
+                    if metric is not None:
+                        results[f"lm-eval_{task}"] = round(metric * 100, 2)
+            except Exception as e:
+                print(f"[WARN] lm-eval failed for {spec.name}: {e}")
+                results["lm-eval"] = "failed"
+
+        return results
+    finally:
+        if spec.is_local_api:
+            if original_no_proxy is None:
+                if 'NO_PROXY' in os.environ:
+                    del os.environ['NO_PROXY']
+            else:
+                os.environ['NO_PROXY'] = original_no_proxy
+            
+            if original_lower_no_proxy is None:
+                if 'no_proxy' in os.environ:
+                    del os.environ['no_proxy']
+            else:
+                os.environ['no_proxy'] = original_lower_no_proxy
+            print("[INFO] Restored original NO_PROXY/no_proxy setting.")
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--base", type=str, default="unsloth/Qwen2.5-Coder-14B-Instruct")
-    parser.add_argument("--fine", type=str, default="./qwen_coder_lora")
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--seed", type=int, default=3407)
+    parser = argparse.ArgumentParser(description="Comprehensive Coder Model Evaluation Script", formatter_class=argparse.RawTextHelpFormatter)
+    
+    # Core
+    parser.add_argument("--models", nargs='+', default=["unsloth/Qwen2.5-Coder-14B-Instruct", "qwen_coder_lora_sft_v3_2"], help="Models to evaluate. Can be HF path, local folder, or 'openai:model_name'.")
+    parser.add_argument("--out_dir", type=str, default=f"eval_results_{now_ts()}", help="Output directory for results, logs, and plots.")
+    parser.add_argument("--device", type=str, default="cuda", help="Device for local model inference (e.g., 'cuda', 'cpu').")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
+    parser.add_argument("--max_seq_length", type=int, default=4096, help="Max sequence length for model loading.")
+    parser.add_argument("--use_4bit_for_eval", action="store_true", help="Use 4-bit quantization for local models.")
+    
+    # API specific
+    parser.add_argument("--api_base", type=str, default=None, help="Base URL for OpenAI-compatible API.")
+    parser.add_argument("--api_key_env", type=str, default="OPENAI_API_KEY", help="Environment variable for API key.")
 
-    parser.add_argument("--max_seq_length", type=int, default=8192)
+    # Evaluation selectors
+    eval_group = parser.add_argument_group('Evaluation Selectors')
+    eval_group.add_argument("--run_all", action="store_true", help="Run all available evaluations.")
+    eval_group.add_argument("--run_benchmark", action="store_true", help="Run throughput and memory benchmark.")
+    eval_group.add_argument("--run_ppl", action="store_true", help="Run Perplexity evaluations.")
+    eval_group.add_argument("--run_induction", action="store_true", help="Run Induction Head evaluation.")
+    eval_group.add_argument("--run_passkey", action="store_true", help="Run Passkey Retrieval evaluation.")
+    eval_group.add_argument("--run_humaneval", action="store_true", help="Run HumanEval pass@1.")
+    eval_group.add_argument("--run_mbpp", action="store_true", help="Run MBPP pass@1.")
+    eval_group.add_argument("--run_evalplus", action="store_true", help="Run EvalPlus (HumanEval+, MBPP+).")
+    eval_group.add_argument("--run_lm_eval", action="store_true", help="Run lm-evaluation-harness.")
+    
+    # Reporting
+    parser.add_argument("--make_figures", action="store_true", help="Generate plots from results.")
 
-    # PPL
-    parser.add_argument("--ppl_max_len", type=int, default=2048)
-    parser.add_argument("--ppl_stride", type=int, default=512)
-    parser.add_argument("--ppl_samples", type=int, default=32)
+    # Evaluation parameters
+    param_group = parser.add_argument_group('Evaluation Parameters')
+    param_group.add_argument("--humaneval_n", type=int, default=164, help="Number of problems for HumanEval.")
+    param_group.add_argument("--humaneval_max_new_tokens", type=int, default=512, help="Max new tokens for HumanEval generation.")
+    param_group.add_argument("--mbpp_n", type=int, default=399, help="Number of problems for MBPP.")
+    param_group.add_argument("--evalplus_parallel", type=int, default=8, help="Number of parallel workers for EvalPlus.")
+    param_group.add_argument("--lm_eval_tasks", type=str, default=None, help="Comma-separated tasks for lm-eval-harness. Defaults to coding tasks.")
+    param_group.add_argument("--lm_eval_backend", type=str, default="hf", choices=["hf", "vllm"], help="Backend for lm-eval-harness for local models.")
+    param_group.add_argument("--lm_eval_batch_size", type=int, default=8)
+    param_group.add_argument("--lm_eval_timeout", type=int, default=7200, help="Timeout in seconds for lm-eval command.")
+    param_group.add_argument("--benchmark_max_new_tokens", type=int, default=256)
+    param_group.add_argument("--ppl_max_len", type=int, default=2048)
+    param_group.add_argument("--ppl_stride", type=int, default=512)
+    param_group.add_argument("--induction_seq_len", type=int, default=256)
+    param_group.add_argument("--induction_samples", type=int, default=20)
+    param_group.add_argument("--passkey_ctx", type=int, default=4096)
+    param_group.add_argument("--passkey_depth", type=float, default=0.5)
+    param_group.add_argument("--passkey_trials", type=int, default=10)
 
-    # Induction
-    parser.add_argument("--induction_seq_len", type=int, default=256)
-    parser.add_argument("--induction_samples", type=int, default=20)
-
-    # Passkey
-    parser.add_argument("--passkey_ctx", type=int, default=4096)
-    parser.add_argument("--passkey_depth", type=float, default=0.5)
-    parser.add_argument("--passkey_trials", type=int, default=10)
-
-    # HumanEval
-    parser.add_argument("--humaneval_n", type=int, default=164)
-    parser.add_argument("--humaneval_max_new_tokens", type=int, default=512)
-
-    # MBPP solve
-    parser.add_argument("--mbpp_n", type=int, default=200)
-    parser.add_argument("--mbpp_max_new_tokens", type=int, default=512)
-
-    # Output
-    parser.add_argument("--out", type=str, default="eval_results_v3.json")
-    parser.add_argument("--plot", type=str, default="qwen_eval_comparison_v3.png")
-
-    # Precision for eval
-    parser.add_argument(
-        "--use_4bit_for_eval",
-        action="store_true",
-        help="Evaluate in 4-bit (faster, but PPL less reliable).",
-    )
 
     args = parser.parse_args()
 
-    print("WARNING: This script executes generated code for HumanEval + MBPP. Run in a sandbox.\n")
+    if args.run_all:
+        args.run_benchmark = args.run_ppl = args.run_induction = args.run_passkey = args.run_humaneval = args.run_mbpp = args.run_evalplus = args.run_lm_eval = True
 
-    print(f"Evaluating BASE: {args.base}")
-    base_res = evaluate_one(
-        model_name_or_path=args.base,
-        device=args.device,
-        max_seq_length=args.max_seq_length,
-        ppl_max_len=args.ppl_max_len,
-        ppl_stride=args.ppl_stride,
-        ppl_samples=args.ppl_samples,
-        induction_seq_len=args.induction_seq_len,
-        induction_samples=args.induction_samples,
-        passkey_ctx=args.passkey_ctx,
-        passkey_depth=args.passkey_depth,
-        passkey_trials=args.passkey_trials,
-        humaneval_n=args.humaneval_n,
-        humaneval_max_new_tokens=args.humaneval_max_new_tokens,
-        mbpp_n=args.mbpp_n,
-        mbpp_max_new_tokens=args.mbpp_max_new_tokens,
-        use_4bit_for_eval=args.use_4bit_for_eval,
-        seed=args.seed,
-    )
-    print(json.dumps(base_res, indent=2))
+    if args.run_lm_eval and not args.lm_eval_tasks:
+        args.lm_eval_tasks = "humaneval"
 
-    print(f"\nEvaluating FINETUNED: {args.fine}")
-    fine_res = evaluate_one(
-        model_name_or_path=args.fine,
-        device=args.device,
-        max_seq_length=args.max_seq_length,
-        ppl_max_len=args.ppl_max_len,
-        ppl_stride=args.ppl_stride,
-        ppl_samples=args.ppl_samples,
-        induction_seq_len=args.induction_seq_len,
-        induction_samples=args.induction_samples,
-        passkey_ctx=args.passkey_ctx,
-        passkey_depth=args.passkey_depth,
-        passkey_trials=args.passkey_trials,
-        humaneval_n=args.humaneval_n,
-        humaneval_max_new_tokens=args.humaneval_max_new_tokens,
-        mbpp_n=args.mbpp_n,
-        mbpp_max_new_tokens=args.mbpp_max_new_tokens,
-        use_4bit_for_eval=args.use_4bit_for_eval,
-        seed=args.seed,
-    )
-    print(json.dumps(fine_res, indent=2))
+    set_seed(args.seed)
+    ensure_dir(args.out_dir)
 
-    payload = {
-        "meta": {
-            "timestamp": now_ts(),
-            "base": args.base,
-            "fine": args.fine,
-            "device": args.device,
-            "use_4bit_for_eval": bool(args.use_4bit_for_eval),
-            "ppl": {"max_len": args.ppl_max_len, "stride": args.ppl_stride, "samples": args.ppl_samples},
-            "induction": {"seq_len": args.induction_seq_len, "samples": args.induction_samples},
-            "passkey": {"ctx": args.passkey_ctx, "depth": args.passkey_depth, "trials": args.passkey_trials},
-            "humaneval": {"n": args.humaneval_n, "max_new_tokens": args.humaneval_max_new_tokens},
-            "mbpp": {"n": args.mbpp_n, "max_new_tokens": args.mbpp_max_new_tokens},
-        },
-        "base": base_res,
-        "finetuned": fine_res,
-    }
+    model_specs = [parse_model_spec(m, args) for m in args.models]
+        
+    all_results = {}
+    for spec in model_specs:
+        try:
+            model_results = evaluate_model(spec, args)
+            all_results[spec.name] = {k: v for k, v in model_results.items() if v is not None}
+            print(f"\n--- Results for {spec.name} ---")
+            print(json.dumps(all_results[spec.name], indent=2))
+        except Exception as e:
+            print(f"\n[CATASTROPHIC ERROR] Evaluation failed for {spec.name}: {e}")
+            all_results[spec.name] = {"status": "catastrophic failure"}
 
-    with open(args.out, "w") as f:
-        json.dump(payload, f, indent=2)
-    print(f"\n[OK] Saved results to: {args.out}")
+    results_path = os.path.join(args.out_dir, "summary.json")
+    with open(results_path, "w") as f: json.dump({"meta": {k:v for k,v in vars(args).items() if not k.startswith('_')}, "results": all_results}, f, indent=2)
+    print(f"\n[OK] All evaluations complete. Summary saved to: {results_path}")
 
-    plot_comparison(base_res, fine_res, args.plot)
-
+    if args.make_figures: plot_results(all_results, args.out_dir)
+    generate_markdown_report(all_results, args.out_dir)
 
 if __name__ == "__main__":
     main()

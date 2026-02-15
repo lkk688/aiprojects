@@ -251,40 +251,7 @@ def solve_instance(model, tokenizer, inst: Dict[str, Any], device: str, rounds: 
             "model_patch": best_patch,
         }
 
-def make_training_args(TrainingArguments, **kwargs):
-    """
-    Transformers TrainingArguments API compatibility shim.
-    Some versions use evaluation_strategy/save_strategy/logging_strategy,
-    others use eval_strategy/save_strategy/logging_strategy (or similar).
-    This tries both safely.
-    """
-    try:
-        return TrainingArguments(**kwargs)
-    except TypeError as e:
-        msg = str(e)
 
-        # Map common renamed args
-        rename_map = {
-            "evaluation_strategy": "eval_strategy",
-            "save_strategy": "save_strategy",      # usually unchanged, but keep for completeness
-            "logging_strategy": "logging_strategy" # usually unchanged
-        }
-
-        # If eval arg not accepted, try eval_strategy
-        if "evaluation_strategy" in kwargs and "evaluation_strategy" in msg:
-            kwargs["eval_strategy"] = kwargs.pop("evaluation_strategy")
-
-        # If save_strategy not accepted, try save_strategy alternative (rare)
-        # (Most versions keep save_strategy, but we keep a fallback pattern)
-        if "save_strategy" in kwargs and "save_strategy" in msg:
-            # try 'save_strategy' -> 'save_strategy' does nothing; placeholder
-            pass
-
-        # If logging_strategy not accepted, try 'log_strategy' (rare)
-        if "logging_strategy" in kwargs and "logging_strategy" in msg:
-            kwargs["log_strategy"] = kwargs.pop("logging_strategy")
-
-        return TrainingArguments(**kwargs)
 
 def main():
     ap = argparse.ArgumentParser()

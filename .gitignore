@@ -20,6 +20,16 @@ whisper_onnx_model
 whisper_onnx_quantized_model
 
 docs
+llama.cpp/
+lm-evaluation-harness/
+CodeAgent/workspace
+*.json
+*.jsonl
+unsloth/
+unsloth_compiled_cache/
+llama.cpp/
+lm-evaluation-harness/
+HybridModel/qwen_coder_lora
 wikisearch/ChinaTextbook
 my_qwen_model
 HybridModel/qwen_coder_lora

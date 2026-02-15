@@ -1,0 +1,905 @@
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+SFT v3.1 (fix HumanEval collapse) for Qwen2.5-Coder-14B-Instruct (Unsloth)
+
+Key changes vs your v3:
+1) REAL completion bucket (HumanEval-style):
+   - We extract function-level prefix/suffix from raw Python code corpora.
+   - This is the most important fix for HumanEval regressions.
+
+2) Reduce “instruction-only” dominance:
+   - We keep Evol/Magicoder but ensure they don’t swamp completion.
+   - We also prevent long “script-like” outputs from overpowering completion.
+
+3) Stronger dataset schema handling:
+   - jtatman/python-code-dataset-500k can have varying columns; we handle both:
+     - raw code corpora (text/code/content/...)
+     - instruction/output (system/instruction/output)
+
+4) Robust mixing:
+   - Buckets are dropped if empty or missing "text"
+   - We enforce target mix by sampling fixed counts per bucket (not purely probabilistic)
+     so you don't accidentally train on mostly one bucket.
+
+5) Keeps datasets==4.3.0 for Unsloth 2026.1.4 compatibility.
+
+Notes:
+- You SHOULD NOT train on HumanEval test prompts. This script does not.
+- MBPP uses split="train" and uses reference "code" as supervised signal.
+- Patch bucket is optional (your own patch_sft.jsonl).
+
+"""
+
+import os
+import sys
+import re
+import json
+import ast
+import random
+import subprocess
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+# Avoid compile memory spikes
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+os.environ.setdefault("TORCHINDUCTOR_DISABLE", "1")
+
+import torch
+
+
+# -----------------------
+# Dependency management
+# -----------------------
+def install_dependencies():
+    print("Installing dependencies...")
+    packages = [
+        "unsloth==2026.1.4",
+        "unsloth_zoo==2026.1.4",
+        "bitsandbytes",
+        "accelerate",
+        "peft",
+        "trl==0.22.2",
+        "triton",
+        "transformers==4.57.3",
+        "sentencepiece",
+        "protobuf",
+        "datasets==4.3.0",
+        "huggingface_hub>=0.34.0",
+        "hf_transfer",
+    ]
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "--no-cache-dir"] + packages)
+    print("Done.")
+
+from datasets import Dataset
+
+def build_completion_from_code_texts(
+    code_texts: List[str],
+    tokenizer,
+    seed: int,
+    min_lines: int = 12,
+    min_suffix_chars: int = 60,
+    max_items: int = 20000,
+):
+    rng = random.Random(seed)
+    out = []
+
+    rng.shuffle(code_texts)
+    for code in code_texts:
+        if not code:
+            continue
+        code = strip_to_code_only(code)
+        if not looks_like_python_code(code):
+            continue
+
+        lines = code.splitlines()
+        if len(lines) < min_lines:
+            continue
+
+        cut = rng.randint(6, max(7, (len(lines) * 2) // 3))
+        prefix = "\n".join(lines[:cut]).rstrip() + "\n"
+        suffix = "\n".join(lines[cut:]).lstrip() + "\n"
+
+        if len(suffix.strip()) < min_suffix_chars:
+            continue
+
+        user = prompt_code_completion(prefix)
+        out.append(make_chat_text(tokenizer, user, suffix))
+
+        if len(out) >= max_items:
+            break
+
+    return Dataset.from_dict({"text": out})
+
+# -----------------------
+# Helpers: TrainingArguments compat
+# -----------------------
+def make_training_args(TrainingArguments, **kwargs):
+    """
+    Transformers TrainingArguments API compatibility shim.
+    Some installs accept eval_strategy instead of evaluation_strategy.
+    """
+    try:
+        return TrainingArguments(**kwargs)
+    except TypeError as e:
+        msg = str(e)
+        if "evaluation_strategy" in kwargs and "evaluation_strategy" in msg:
+            kwargs["eval_strategy"] = kwargs.pop("evaluation_strategy")
+        if "logging_strategy" in kwargs and "logging_strategy" in msg:
+            kwargs["log_strategy"] = kwargs.pop("logging_strategy")
+        return TrainingArguments(**kwargs)
+
+
+# -----------------------
+# Code-only cleaning
+# -----------------------
+_CODE_FENCE_RE = re.compile(r"```(?:python)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+
+def strip_to_code_only(text: str) -> str:
+    """
+    Extract code from a string.
+    - Prefer fenced blocks.
+    - Remove obvious prose prefaces.
+    - Keep result as-is (do NOT over-filter; filtering can break logic).
+    """
+    if not isinstance(text, str) or not text.strip():
+        return ""
+
+    t = text.strip()
+    m = _CODE_FENCE_RE.search(t)
+    if m:
+        t = m.group(1).strip()
+
+    # Remove common assistant preface lines (light touch)
+    t = re.sub(r"^\s*(Sure|Here(?:'|’)s|Here is|Below is).*?\n", "", t, flags=re.IGNORECASE).strip()
+
+    # Ensure trailing newline for training stability
+    return (t + "\n") if t else ""
+
+
+def looks_like_python_code(text: str) -> bool:
+    if not isinstance(text, str):
+        return False
+    t = text.strip()
+    if len(t) < 20:
+        return False
+    return any(k in t for k in ("def ", "class ", "import ", "from "))
+
+
+# -----------------------
+# Chat formatting
+# -----------------------
+def make_chat_text(tokenizer, user: str, assistant: str) -> str:
+    if hasattr(tokenizer, "apply_chat_template"):
+        convo = [{"role": "user", "content": user},
+                 {"role": "assistant", "content": assistant}]
+        return tokenizer.apply_chat_template(convo, tokenize=False, add_generation_prompt=False)
+    return f"User:\n{user}\n\nAssistant:\n{assistant}"
+
+
+# -----------------------
+# Prompt builders
+# -----------------------
+def prompt_code_completion(prefix: str) -> str:
+    return (
+        "Complete the following Python code.\n"
+        "Rules:\n"
+        "- Return ONLY valid Python code (the continuation).\n"
+        "- No markdown.\n"
+        "- No explanation.\n\n"
+        "Code:\n"
+        f"{prefix}"
+    )
+
+
+def prompt_instruction_to_code(instr: str) -> str:
+    return (
+        "Write correct Python code for the following request.\n"
+        "Rules:\n"
+        "- Return ONLY valid Python code.\n"
+        "- No markdown.\n"
+        "- No explanation.\n\n"
+        f"Request:\n{instr}\n"
+    )
+
+
+def prompt_mbpp(problem: str, entry_point: str = "") -> str:
+    if entry_point:
+        return (
+            "Write a correct Python solution.\n"
+            "Rules:\n"
+            "- Return ONLY valid Python code.\n"
+            "- No markdown.\n"
+            "- No explanation.\n"
+            f"- You MUST implement a function named `{entry_point}` exactly.\n\n"
+            f"Problem:\n{problem}\n"
+        )
+    return (
+        "Write a correct Python solution.\n"
+        "Rules:\n"
+        "- Return ONLY valid Python code.\n"
+        "- No markdown.\n"
+        "- No explanation.\n\n"
+        f"Problem:\n{problem}\n"
+    )
+
+
+def prompt_patch(problem: str, fail_log_tail: str, repo_summary: str = "") -> str:
+    return (
+        "You are a software engineer fixing a real repository bug.\n"
+        "Rules:\n"
+        "- Output ONLY a unified diff patch.\n"
+        "- Start with: diff --git a/... b/...\n"
+        "- Do NOT include markdown or explanations.\n"
+        "- Keep the patch minimal.\n"
+        "- Make tests pass.\n\n"
+        f"Issue:\n{problem}\n\n"
+        f"Repository summary:\n{repo_summary}\n\n"
+        f"Failing log (tail):\n{fail_log_tail}\n\n"
+        "Now output the patch ONLY:\n"
+    )
+
+
+# -----------------------
+# Dataset helpers
+# -----------------------
+def infer_entry_point_from_mbpp_tests(tests: List[str], problem_text: str) -> str:
+    joined = "\n".join(tests or [])
+    m = re.search(r"assert\s+([A-Za-z_]\w*)\s*\(", joined)
+    if m:
+        return m.group(1)
+    m = re.search(r"\bfunction\s+([A-Za-z_]\w*)\b", problem_text or "")
+    if m:
+        return m.group(1)
+    m = re.search(r"\bnamed\s+([A-Za-z_]\w*)\b", problem_text or "")
+    if m:
+        return m.group(1)
+    return ""
+
+
+def load_patch_sft_jsonl(path: str):
+    from datasets import load_dataset
+    if not path or not os.path.exists(path):
+        return None
+    ds = load_dataset("json", data_files=path, split="train")
+    if "prompt" not in ds.column_names or "patch" not in ds.column_names:
+        print(f"[WARN] patch_sft.jsonl missing prompt/patch fields: {ds.column_names}")
+        return None
+    return ds
+
+
+def nonempty_text(ds, min_len: int = 32):
+    if "text" not in ds.column_names:
+        return ds
+
+    def _is_valid(x):
+        txt = x.get("text", "")
+        if not isinstance(txt, str) or len(txt) < min_len:
+            return False
+
+        # Heuristic: check Python code blocks if present
+        code_blocks = re.findall(r"```(?:python)?\s*(.*?)```", txt, re.DOTALL | re.IGNORECASE)
+        if not code_blocks:
+            # If no blocks, check if the whole text is parseable code
+            # (only if it looks like Python to avoid filtering pure text/chat)
+            if looks_like_python_code(txt):
+                try:
+                    ast.parse(txt)
+                except SyntaxError:
+                    return False
+            return True
+
+        for code in code_blocks:
+            c = code.strip()
+            if not c or len(c) < 20:
+                continue
+            try:
+                ast.parse(c)
+            except SyntaxError:
+                return False
+        return True
+
+    return ds.filter(_is_valid)
+
+
+def drop_if_bad(name: str, ds):
+    if ds is None:
+        return None
+    if "text" not in ds.column_names:
+        print(f"[WARN] bucket '{name}' has no 'text' column -> DROPPED. columns={ds.column_names}")
+        return None
+    if len(ds) == 0:
+        print(f"[WARN] bucket '{name}' empty -> DROPPED.")
+        return None
+    return ds
+
+
+# -----------------------
+# Completion extraction (HumanEval-style)
+# -----------------------
+def extract_function_completion_pairs(
+    code: str,
+    rng: random.Random,
+    min_func_lines: int = 12,
+    min_suffix_chars: int = 80,
+) -> List[Tuple[str, str]]:
+    """
+    Convert a Python file into (prefix, suffix) completion pairs by slicing inside function bodies.
+    Uses AST to find function definitions and cut between statements.
+    """
+    if not isinstance(code, str):
+        return []
+    
+    # Fast path check
+    if len(code) < 200:
+        return []
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+
+    lines = code.splitlines(keepends=True)
+    if not lines:
+        return []
+
+    # Find candidate functions
+    candidates = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # approximate length in lines
+            start = node.lineno - 1
+            # node.end_lineno is available in Python 3.8+
+            end = getattr(node, "end_lineno", node.lineno + len(node.body))
+            if (end - start) >= min_func_lines:
+                candidates.append(node)
+
+    if not candidates:
+        return []
+
+    pairs: List[Tuple[str, str]] = []
+    rng.shuffle(candidates)
+
+    for node in candidates:
+        body_nodes = node.body
+        if len(body_nodes) < 2:
+            continue
+
+        # Heuristic: Pick roughly middle
+        low = max(1, int(len(body_nodes) * 0.3))
+        high = max(low + 1, int(len(body_nodes) * 0.8))
+        if high <= low:
+            continue
+        
+        split_idx = rng.randint(low, high - 1)
+        split_stmt = body_nodes[split_idx]
+        
+        # cut_lineno is 0-indexed line number where the split statement starts
+        cut_lineno = split_stmt.lineno - 1
+        
+        if cut_lineno <= 0 or cut_lineno >= len(lines):
+            continue
+
+        prefix = "".join(lines[:cut_lineno])
+        suffix = "".join(lines[cut_lineno:])
+
+        if len(suffix.strip()) < min_suffix_chars:
+            continue
+
+        pairs.append((prefix, suffix))
+        if len(pairs) >= 2:
+            break
+
+    return pairs
+
+def main():
+    # NOTE: This main() is designed to be **robust**:
+    # - NO dependency on datasets that are “metadata-only” (no code text), or require dataset scripts.
+    # - Completion bucket is built from **real code you already loaded** (Magicoder/Evol/MBPP),
+    #   so it will not go empty and collapse HumanEval again.
+    #
+    # It assumes you already have these top-level helpers in your file:
+    #   - install_dependencies()
+    #   - make_training_args()
+    #   - strip_to_code_only()
+    #   - looks_like_python_code()
+    #   - make_chat_text(tokenizer, user, assistant)
+    #   - prompt_code_completion(prefix)
+    #   - prompt_mbpp(problem, entry_point="")
+    #   - infer_entry_point_from_mbpp_tests(tests, problem_text)
+    #   - load_patch_sft_jsonl(path)
+    #
+    # If any of those are missing, move the small inner versions below to global scope.
+
+    import random
+    import json
+    import torch
+    from dataclasses import dataclass
+
+    try:
+        from unsloth import FastLanguageModel, is_bfloat16_supported
+        from trl import SFTTrainer
+        from transformers import TrainingArguments
+        from datasets import load_dataset, Dataset
+    except Exception:
+        install_dependencies()
+        from unsloth import FastLanguageModel, is_bfloat16_supported
+        from trl import SFTTrainer
+        from transformers import TrainingArguments
+        from datasets import load_dataset, Dataset
+
+    @dataclass
+    class CFG:
+        base_model: str = "unsloth/Qwen2.5-Coder-14B-Instruct"
+        output_lora: str = "qwen_coder_lora_sft_v3_2"
+        seed: int = 3407
+
+        max_seq_length: int = 2048
+        load_in_4bit: bool = True
+
+        per_device_bs: int = 4
+        grad_acc: int = 4
+        epochs: float = 1.0
+        lr: float = 7.0e-6
+        wd: float = 0.01
+
+        eval_steps: int = 250
+        save_steps: int = 500
+
+        # Subsample sizes (raw loads)
+        n_magicoder: int = 12000
+        n_evol: int = 12000
+        n_py_instr: int = 60000
+        n_mbpp_train: int = 2000
+
+        patch_jsonl: str = "data/patch_sft.jsonl"
+        packing: bool = True
+
+        # Final mix targets (completion must dominate)
+        mix_completion: int = 42000
+        mix_mbpp: int = 12000
+        mix_evol: int = 8000
+        mix_magicoder: int = 6000
+        mix_py_instr: int = 6000
+        mix_patch: int = 0
+
+        max_mixed: int = 80000
+
+        # Completion construction knobs
+        completion_max_pairs_per_code: int = 2
+        completion_min_lines: int = 12
+        completion_min_suffix_chars: int = 60
+
+        neftune_noise_alpha: float = 5.0
+
+    cfg = CFG()
+    rng = random.Random(cfg.seed)
+    random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed)
+
+    # -----------------------
+    # Small local helpers (robust)
+    # -----------------------
+    def nonempty_text(ds: "Dataset", min_len: int = 32) -> "Dataset":
+        if ds is None:
+            return ds
+        if "text" not in ds.column_names:
+            return ds
+        return ds.filter(lambda x: isinstance(x.get("text", None), str) and len(x["text"]) > min_len)
+
+    def drop_if_bad(name: str, ds: "Dataset"):
+        if ds is None:
+            return None
+        if "text" not in ds.column_names:
+            print(f"[WARN] bucket '{name}' has no 'text' column -> DROPPED. columns={ds.column_names}")
+            return None
+        if len(ds) == 0:
+            print(f"[WARN] bucket '{name}' empty -> DROPPED.")
+            return None
+        return ds
+
+    def prompt_instruction_to_code(instr: str) -> str:
+        return (
+            "Write correct Python code for the following request.\n"
+            "Rules:\n"
+            "- Return ONLY valid Python code.\n"
+            "- No markdown fences.\n"
+            "- No explanations.\n\n"
+            f"Request:\n{instr}\n"
+        )
+
+    def extract_completion_pairs_from_code(code: str, rng: random.Random):
+        """
+        HumanEval-style completion: take a code snippet, cut mid-way, train suffix generation.
+        Returns list of (prefix, suffix) pairs.
+        Uses AST with fallback to simple splitting.
+        """
+        code = strip_to_code_only(code)
+        if not looks_like_python_code(code):
+            return []
+        
+        # Try AST extraction first
+        pairs = extract_function_completion_pairs(
+            code,
+            rng,
+            min_func_lines=cfg.completion_min_lines,
+            min_suffix_chars=cfg.completion_min_suffix_chars,
+        )
+        if pairs:
+            return pairs
+
+        # Fallback: simple line-based split if AST failed or found nothing
+        # This ensures we don't discard valid code just because it's not a function or AST fails
+        lines = code.splitlines(keepends=True)
+        if len(lines) < cfg.completion_min_lines:
+            return []
+        
+        # Try a few random cuts
+        for _ in range(2):
+            # Cut somewhere in the middle 20-80%
+            cut = rng.randint(int(len(lines)*0.2), int(len(lines)*0.8))
+            prefix = "".join(lines[:cut])
+            suffix = "".join(lines[cut:])
+            if len(suffix.strip()) >= cfg.completion_min_suffix_chars:
+                return [(prefix, suffix)]
+        
+        return []
+
+    def build_completion_bucket_from_sources(
+        magic_raw, evol_raw, mbpp_raw
+    ) -> "Dataset":
+        """
+        Builds completion dataset from *existing* code fields:
+        - Magicoder: solution
+        - Evol: output
+        - MBPP: code
+        """
+        texts = []
+
+        # Magicoder solutions
+        if magic_raw is not None:
+            for example in magic_raw:
+                s = example.get("solution", None)
+                if isinstance(s, str) and len(s) >= 120:
+                    for prefix, suffix in extract_completion_pairs_from_code(s, rng):
+                        user = prompt_code_completion(prefix)
+                        texts.append(make_chat_text(tokenizer, user, suffix))
+
+        # Evol outputs
+        if evol_raw is not None:
+            for example in evol_raw:
+                s = example.get("output", None)
+                if isinstance(s, str) and len(s) >= 120:
+                    for prefix, suffix in extract_completion_pairs_from_code(s, rng):
+                        user = prompt_code_completion(prefix)
+                        texts.append(make_chat_text(tokenizer, user, suffix))
+
+        # MBPP reference code
+        if mbpp_raw is not None:
+            for example in mbpp_raw:
+                s = example.get("code", None)
+                if isinstance(s, str) and len(s) >= 120:
+                    for prefix, suffix in extract_completion_pairs_from_code(s, rng):
+                        user = prompt_code_completion(prefix)
+                        texts.append(make_chat_text(tokenizer, user, suffix))
+
+        return Dataset.from_dict({"text": texts})
+
+    # -----------------------
+    # Load model
+    # -----------------------
+    print(f"Loading model: {cfg.base_model}")
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=cfg.base_model,
+        max_seq_length=cfg.max_seq_length,
+        dtype=None,
+        load_in_4bit=cfg.load_in_4bit,
+    )
+
+    print("Adding LoRA...")
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=16,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_alpha=16,
+        lora_dropout=0,
+        bias="none",
+        use_gradient_checkpointing="unsloth",
+        random_state=cfg.seed,
+        use_rslora=False,
+        loftq_config=None,
+    )
+
+    # -----------------------
+    # Load datasets (NO scripted datasets)
+    # -----------------------
+    print("Loading datasets...")
+
+    magic = load_dataset("ise-uiuc/Magicoder-OSS-Instruct-75K", split="train", trust_remote_code=False)
+    if len(magic) > cfg.n_magicoder:
+        magic = magic.shuffle(seed=cfg.seed).select(range(cfg.n_magicoder))
+
+    evol = load_dataset("nickrosh/Evol-Instruct-Code-80k-v1", split="train", trust_remote_code=False)
+    if len(evol) > cfg.n_evol:
+        evol = evol.shuffle(seed=cfg.seed).select(range(cfg.n_evol))
+
+    py_instr = load_dataset("jtatman/python-code-dataset-500k", split="train", trust_remote_code=False)
+    if len(py_instr) > cfg.n_py_instr:
+        py_instr = py_instr.shuffle(seed=cfg.seed).select(range(cfg.n_py_instr))
+
+    mbpp = load_dataset("mbpp", split="train", trust_remote_code=False)
+    if len(mbpp) > cfg.n_mbpp_train:
+        mbpp = mbpp.shuffle(seed=cfg.seed).select(range(cfg.n_mbpp_train))
+
+    patch_ds = load_patch_sft_jsonl(cfg.patch_jsonl)
+    if patch_ds is None or len(patch_ds) == 0:
+        patch_ds = None
+        print("[WARN] No patch_sft.jsonl found or empty; patch bucket disabled.")
+    else:
+        cfg.mix_patch = min(4000, len(patch_ds))
+        print(f"[OK] Loaded patch SFT: {cfg.patch_jsonl} ({len(patch_ds)} rows), mix_patch={cfg.mix_patch}")
+
+    print("[DEBUG] magic columns   :", magic.column_names)
+    print("[DEBUG] evol columns    :", evol.column_names)
+    print("[DEBUG] py_instr columns:", py_instr.column_names)
+    print("[DEBUG] mbpp columns    :", mbpp.column_names)
+    if patch_ds is not None:
+        print("[DEBUG] patch columns   :", patch_ds.column_names)
+
+    # -----------------------
+    # Format buckets -> {"text"}
+    # -----------------------
+    def fmt_magic(examples):
+        outs = []
+        problems = examples.get("problem", [])
+        solutions = examples.get("solution", [])
+        langs = examples.get("lang", None)
+
+        for i, (p, s) in enumerate(zip(problems, solutions)):
+            if not p or not s:
+                continue
+            if langs is not None:
+                lg = langs[i]
+                if lg and ("python" not in str(lg).lower()):
+                    continue
+            s_code = strip_to_code_only(s)
+            if not looks_like_python_code(s_code):
+                continue
+            user = prompt_instruction_to_code(p)
+            outs.append(make_chat_text(tokenizer, user, s_code))
+        return {"text": outs}
+
+    def fmt_evol(examples):
+        outs = []
+        instrs = examples.get("instruction", [])
+        outs_raw = examples.get("output", [])
+        for instr, out in zip(instrs, outs_raw):
+            if not instr or not out:
+                continue
+            out_code = strip_to_code_only(out)
+            if not looks_like_python_code(out_code):
+                continue
+            user = prompt_instruction_to_code(instr)
+            outs.append(make_chat_text(tokenizer, user, out_code))
+        return {"text": outs}
+
+    def fmt_py_instr(examples):
+        outs = []
+        sys_msgs = examples.get("system", [])
+        instrs = examples.get("instruction", [])
+        outs_raw = examples.get("output", [])
+        # Some datasets may have shorter lists; guard by min length
+        m = min(len(instrs), len(outs_raw), len(sys_msgs) if isinstance(sys_msgs, list) else len(instrs))
+        for i in range(m):
+            sysm = sys_msgs[i] if isinstance(sys_msgs, list) else ""
+            instr = instrs[i]
+            out = outs_raw[i]
+            if not instr or not out:
+                continue
+            out_code = strip_to_code_only(out)
+            if not looks_like_python_code(out_code):
+                continue
+            sysm = (sysm or "").strip()
+            if sysm:
+                user = f"System:\n{sysm}\n\n" + prompt_instruction_to_code(instr)
+            else:
+                user = prompt_instruction_to_code(instr)
+            outs.append(make_chat_text(tokenizer, user, out_code))
+        return {"text": outs}
+
+    def fmt_mbpp_row(ex):
+        problem = ex.get("text", "") or ""
+        tests = ex.get("test_list", []) or []
+        code = strip_to_code_only(ex.get("code", "") or "")
+        if not problem or not code:
+            return None
+        if not looks_like_python_code(code):
+            return None
+        entry = infer_entry_point_from_mbpp_tests(tests, problem)
+        user = prompt_mbpp(problem, entry_point=entry)
+        return make_chat_text(tokenizer, user, code)
+
+    def fmt_patch(examples):
+        outs = []
+        prompts = examples.get("prompt", [])
+        patches = examples.get("patch", [])
+        for p, d in zip(prompts, patches):
+            if not p or not d:
+                continue
+            d = d.strip() + "\n"
+            if ("diff --git" not in d) and (not d.startswith("---")):
+                continue
+            outs.append(make_chat_text(tokenizer, p, d))
+        return {"text": outs}
+
+    # Keep raw copies (for completion construction)
+    magic_raw = magic
+    evol_raw = evol
+    mbpp_raw = mbpp
+
+    # Map instruction buckets
+    magic = magic.map(fmt_magic, batched=True, remove_columns=magic.column_names)
+    evol = evol.map(fmt_evol, batched=True, remove_columns=evol.column_names)
+    py_instr = py_instr.map(fmt_py_instr, batched=True, remove_columns=py_instr.column_names)
+
+    # MBPP row-by-row (schema varies)
+    mbpp_texts = []
+    for ex in mbpp:
+        t = fmt_mbpp_row(ex)
+        if t is not None:
+            mbpp_texts.append(t)
+    mbpp = Dataset.from_dict({"text": mbpp_texts})
+
+    # Patch
+    if patch_ds is not None:
+        patch_ds = patch_ds.map(fmt_patch, batched=True, remove_columns=patch_ds.column_names)
+    else:
+        patch_ds = Dataset.from_dict({"text": []})
+
+    # -----------------------
+    # Completion bucket (ROBUST): build from Magic/Evol/MBPP code fields
+    # -----------------------
+    completion = build_completion_bucket_from_sources(
+        magic_raw=magic_raw,
+        evol_raw=evol_raw,
+        mbpp_raw=mbpp_raw,
+    )
+
+    # Filters
+    magic = nonempty_text(magic, 32)
+    evol = nonempty_text(evol, 32)
+    py_instr = nonempty_text(py_instr, 32)
+    mbpp = nonempty_text(mbpp, 32)
+    completion = nonempty_text(completion, 32)
+    patch_ds = nonempty_text(patch_ds, 32)
+
+    # Drop bad
+    magic = drop_if_bad("magicoder", magic)
+    evol = drop_if_bad("evol", evol)
+    py_instr = drop_if_bad("py_instr", py_instr)
+    mbpp = drop_if_bad("mbpp", mbpp)
+    completion = drop_if_bad("completion", completion)
+    patch_ds = drop_if_bad("patch", patch_ds)
+
+    print("\nSizes after formatting:")
+    print("  completion:", (len(completion) if completion is not None else 0))
+    print("  mbpp      :", (len(mbpp) if mbpp is not None else 0))
+    print("  evol      :", (len(evol) if evol is not None else 0))
+    print("  magicoder :", (len(magic) if magic is not None else 0))
+    print("  py_instr  :", (len(py_instr) if py_instr is not None else 0))
+    print("  patch     :", (len(patch_ds) if patch_ds is not None else 0))
+
+    # Hard requirement: completion must exist
+    if completion is None or len(completion) == 0:
+        raise RuntimeError(
+            "Completion bucket is empty even after fallback construction. "
+            "This should not happen unless your code fields are missing."
+        )
+
+    # -----------------------
+    # Fixed-count mixing
+    # -----------------------
+    mix_plan = []
+    mix_plan.append(("completion", completion, min(cfg.mix_completion, len(completion))))
+    if mbpp is not None and len(mbpp) > 0:
+        mix_plan.append(("mbpp", mbpp, min(cfg.mix_mbpp, len(mbpp))))
+    if evol is not None and len(evol) > 0:
+        mix_plan.append(("evol", evol, min(cfg.mix_evol, len(evol))))
+    if magic is not None and len(magic) > 0:
+        mix_plan.append(("magicoder", magic, min(cfg.mix_magicoder, len(magic))))
+    if py_instr is not None and len(py_instr) > 0:
+        mix_plan.append(("py_instr", py_instr, min(cfg.mix_py_instr, len(py_instr))))
+    if patch_ds is not None and len(patch_ds) > 0 and cfg.mix_patch > 0:
+        mix_plan.append(("patch", patch_ds, min(cfg.mix_patch, len(patch_ds))))
+
+    total_target = sum(n for _, _, n in mix_plan)
+    if total_target > cfg.max_mixed:
+        overflow = total_target - cfg.max_mixed
+        order = ["py_instr", "magicoder", "evol", "mbpp", "patch"]
+        plan = [[a, b, c] for a, b, c in mix_plan]
+        idx = {x[0]: i for i, x in enumerate(plan)}
+        for nm in order:
+            if overflow <= 0:
+                break
+            if nm in idx:
+                i = idx[nm]
+                reducible = max(0, plan[i][2] - 1000)
+                dec = min(reducible, overflow)
+                plan[i][2] -= dec
+                overflow -= dec
+        mix_plan = [(a, b, int(c)) for a, b, c in plan if int(c) > 0]
+
+    mixed_texts = []
+    for name, ds, k in mix_plan:
+        if k <= 0:
+            continue
+        if len(ds) >= k:
+            picked = ds.shuffle(seed=cfg.seed).select(range(k))
+            mixed_texts.extend(picked["text"])
+        else:
+            for _ in range(k):
+                mixed_texts.append(ds[rng.randrange(len(ds))]["text"])
+
+    rng.shuffle(mixed_texts)
+    mixed_ds = Dataset.from_dict({"text": mixed_texts}).shuffle(seed=cfg.seed)
+
+    split = mixed_ds.train_test_split(test_size=0.02, seed=cfg.seed)
+    train_ds = split["train"]
+    eval_ds = split["test"]
+
+    print("\nMix plan:")
+    for name, ds, k in mix_plan:
+        print(f"  {name:10s} k={k:6d} (bucket_size={len(ds)})")
+    print(f"Mixed dataset size: {len(mixed_ds)} | Train: {len(train_ds)} | Eval: {len(eval_ds)}")
+
+    # -----------------------
+    # Train
+    # -----------------------
+    training_args = make_training_args(
+        TrainingArguments,
+        output_dir="outputs_sft_v3_2b",
+        per_device_train_batch_size=cfg.per_device_bs,
+        gradient_accumulation_steps=cfg.grad_acc,
+        num_train_epochs=cfg.epochs,
+        learning_rate=cfg.lr,
+        warmup_ratio=0.03,
+        logging_steps=20,
+        evaluation_strategy="steps",
+        eval_steps=cfg.eval_steps,
+        save_strategy="steps",
+        save_steps=cfg.save_steps,
+        save_total_limit=2,
+        weight_decay=cfg.wd,
+        lr_scheduler_type="linear",
+        optim="adamw_8bit",
+        bf16=is_bfloat16_supported(),
+        fp16=not is_bfloat16_supported(),
+        report_to="none",
+        seed=cfg.seed,
+        torch_compile=False,
+        neftune_noise_alpha=cfg.neftune_noise_alpha,
+    )
+
+    print("\nStarting SFT v3.2 training...")
+    trainer = SFTTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
+        dataset_text_field="text",
+        max_seq_length=cfg.max_seq_length,
+        packing=cfg.packing,
+        args=training_args,
+    )
+
+    trainer.train()
+
+    print(f"\nSaving LoRA to: {cfg.output_lora}")
+    model.save_pretrained(cfg.output_lora)
+    tokenizer.save_pretrained(cfg.output_lora)
+    print("Done.")
+
+if __name__ == "__main__":
+    main()
