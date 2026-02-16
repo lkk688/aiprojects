@@ -83,19 +83,13 @@ class CodeAgent:
 
         # General-purpose system prompt focusing on agentic behavior and formatting
         self.system_prompt = (
-            "You are a professional software engineer agent. Your goal is to implement requested functionality with high precision and robustness.\n\n"
+            "You are a professional software engineer agent. Your goal is to implement requested functionality with high precision.\n\n"
             "OPERATING PRINCIPLES:\n"
-            "1. OUTPUT FORMAT: You MUST output files using the 'FILE: path/to/file' marker followed by a markdown code block. Do NOT use single large JSON objects.\n"
-            "   Example:\n"
-            "   FILE: tasks/<task_id>/task.py\n"
-            "   ```python\n"
-            "   # code here...\n"
-            "   ```\n"
-            "2. MODULARITY: Strictly adhere to any specified project structure and interfaces provided in the task instructions.\n"
-            "3. CONTINUATION: If your output is truncated (hits context limit), stop exactly where you are. You will be asked to continue. "
-            "When continuing, do NOT repeat previous content; start exactly from the next character or line to maintain code integrity.\n"
-            "4. ROBUSTNESS: Ensure code is logically sound, handles edge cases, and follows best practices for requested frameworks.\n"
-            "5. PHASES: Focus only on the current phase requested. Do not implement everything if only a specific part is asked for."
+            "1. OUTPUT FORMAT: You MUST output files using the 'FILE: path/to/file' marker followed by a markdown code block.\n"
+            "2. MODULARITY: Strictly adhere to specified project structure and mandatory interfaces.\n"
+            "3. CONTINUATION: If output is truncated, stop exactly where you are. You will be asked to continue. "
+            "When continuing, start exactly from the next character to maintain code integrity. Do NOT repeat previous headers or code.\n"
+            "4. CONSISTENCY: Phase 2 (tests) MUST be 100% compatible with Phase 1 (code) signatures and return types. Read the provided code context carefully."
         )
 
     def generate_content(self, task: Dict, phase_instruction: str, context_code: Optional[str] = None, error_log: Optional[str] = None) -> Tuple[str, Dict]:
@@ -110,14 +104,13 @@ class CodeAgent:
             f"Requirements:\n{json.dumps(task.get('requirements', {}), indent=2)}\n\n"
         )
 
-        # Dynamically load task-specific protocol instructions
         if protocol_instr:
-            user_prompt += f"--- SPECIFIC PROJECT RULES ---\n{protocol_instr}\n\n"
+            user_prompt += f"--- MANDATORY INTERFACE PROTOCOL (MUST FOLLOW EXACTLY) ---\n{protocol_instr}\n\n"
 
         if context_code:
             code_budget = self.args.max_model_len // 2
             truncated_code = truncate_text_tokens(self.args.vllm_url, self.args.model, context_code, code_budget)
-            user_prompt += f"--- EXISTING CODE CONTEXT ---\n{truncated_code}\n\n"
+            user_prompt += f"--- PHASE 1 CODE CONTEXT (READ CAREFULLY) ---\n{truncated_code}\n\n"
 
         if error_log:
             err_budget = self.args.max_model_len // 10
@@ -136,7 +129,6 @@ class CodeAgent:
         total_completion_tokens = 0
         start_time = time.time()
         
-        # Continuation loop
         for turn in range(5):
             max_tokens = compute_max_tokens(
                 self.args.vllm_url, self.args.model, messages, self.args.max_model_len, desired=self.args.gen_max_tokens
@@ -168,7 +160,8 @@ class CodeAgent:
             
             print(f"  [Agent] Turn {turn+1} truncated. Requesting continuation...")
             messages.append({"role": "assistant", "content": chunk})
-            messages.append({"role": "user", "content": "The output was truncated. Continue exactly from where you stopped. Do NOT repeat previous headers or code."})
+            # Stricter continuation prompt
+            messages.append({"role": "user", "content": "The output was truncated. Continue exactly from where you stopped. Do NOT repeat previous headers or code. ONLY provide the remaining code content."})
 
         duration = time.time() - start_time
         stats = {"duration": duration, "completion_tokens": total_completion_tokens}
@@ -176,29 +169,36 @@ class CodeAgent:
 
     @staticmethod
     def extract_files(raw_text: str) -> Dict[str, str]:
-        """Extract files from 'FILE: path' markers with support for multi-turn continuations."""
+        """Extract files from 'FILE: path' markers with robust continuation handling."""
         files = {}
-        # Split by FILE: marker, but handle cases where it might be in the middle of a line due to bad continuation
-        parts = re.split(r"(?mi)^FILE:\s*|FILE:\s*", raw_text)
+        # Split by FILE: marker
+        parts = re.split(r"(?mi)^FILE:\s*", raw_text)
         for part in parts:
             if not part.strip(): continue
-            # Chunk starts with the path
+            
             lines = part.strip().splitlines()
             if not lines: continue
             path = lines[0].strip()
-            body = "\n".join(lines[1:])
+            content_area = "\n".join(lines[1:])
             
-            # Remove markdown fences and any dangling "FILE:" text that might have survived the split
-            clean_body = re.sub(r"```(?:\w+)?\n", "", body)
-            clean_body = re.sub(r"\n```", "", clean_body)
-            # Remove potentially repeated headers in bad continuations
-            clean_body = re.sub(r"(?mi)^FILE:\s*.*?\n", "", clean_body)
+            # Extract content from ALL code blocks
+            code_blocks = re.findall(r"```(?:\w+)?\n(.*?)(?:\n```|$)", content_area, re.DOTALL)
+            
+            if code_blocks:
+                clean_content = "\n".join(code_blocks)
+            else:
+                # If no fences, but it's a known file being continued, take it all
+                # But remove trailing backticks if any
+                clean_content = re.sub(r"```(?:\w+)?$", "", content_area.strip())
+                if path not in files:
+                    # New file with no fences? Skip to avoid conversational noise
+                    continue
             
             if path in files:
-                if clean_body.strip() not in files[path]:
-                    files[path] += "\n" + clean_body
+                if clean_content.strip() and clean_content.strip() not in files[path]:
+                    files[path] += "\n" + clean_content
             else:
-                files[path] = clean_body
+                files[path] = clean_content
         return files
 
 
@@ -236,7 +236,14 @@ def run_task_tests(task_id: str, output_dir: str) -> Tuple[bool, str]:
     )
     
     # Retry on CPU if GPU is OOM
-    if any(msg in out for msg in ["CUDA error: out of memory", "RuntimeError: CUDA out of memory"]):
+    oom_msgs = [
+        "CUDA error: out of memory", 
+        "RuntimeError: CUDA out of memory", 
+        "torch.cuda.OutOfMemoryError", 
+        "AcceleratorError: CUDA error: out of memory",
+        "AllocationError"
+    ]
+    if any(msg in out for msg in oom_msgs):
         print("  [Runner] CUDA OOM. Retrying on CPU...")
         env_cpu = {**os.environ, "CUDA_VISIBLE_DEVICES": ""}
         res = subprocess.run(
@@ -253,7 +260,7 @@ def run_task_tests(task_id: str, output_dir: str) -> Tuple[bool, str]:
 def main():
     parser = argparse.ArgumentParser(description="General Purpose ML Code Agent")
     parser.add_argument("--model", default="Qwen/Qwen3-Coder-Next-FP8")
-    parser.add_argument("--vllm_url", default="http://localhost:8000/v1")
+    parser.add_argument("--vllm_url", default="http://127.0.0.1:8000/v1")
     parser.add_argument("--api_key", default="myhpcvllmqwen")
     parser.add_argument("--max_model_len", type=int, default=16384)
     parser.add_argument("--gen_max_tokens", type=int, default=4096)
@@ -306,11 +313,14 @@ def main():
 
                     # PHASE 1: Core Implementation
                     print(f"  [Agent] Phase 1: Algorithm & Docs...")
-                    raw1, stats1 = agent.generate_content(
-                        task, 
-                        "PHASE 1: Implement core algorithm in tasks/<task_id>/task.py and README.md.",
-                        error_log=last_err
+                    phase1_prompt = (
+                        "PHASE 1: Implement core algorithm in tasks/<task_id>/task.py and README.md.\n"
+                        "CHECKLIST:\n"
+                        "1. Follow the MANDATORY INTERFACE PROTOCOL exactly.\n"
+                        "2. Signatures MUST match: get_task_metadata(), set_seed(seed), get_device(), make_dataloaders(cfg), build_model(cfg), train(cfg), evaluate(cfg, state), predict(cfg, state, X), save_artifacts(cfg, state, outputs).\n"
+                        "3. Use .to(device) for all tensors/modules inside ALL functions."
                     )
+                    raw1, stats1 = agent.generate_content(task, phase1_prompt, error_log=last_err)
                     files1 = agent.extract_files(raw1)
                     if not files1:
                         error_history.append("Error: Phase 1 output empty.")
@@ -319,12 +329,16 @@ def main():
 
                     # PHASE 2: Tests
                     print(f"  [Agent] Phase 2: Tests...")
-                    raw2, stats2 = agent.generate_content(
-                        task, 
-                        "PHASE 2: Now provide comprehensive pytest tests in tasks/<task_id>/tests/test_task.py.", 
-                        context_code=phase1_code,
-                        error_log=last_err # Pass error to tests too if relevant
+                    phase2_prompt = (
+                        "PHASE 2: Provide comprehensive isolated pytest tests in tasks/<task_id>/tests/test_task.py.\n"
+                        "CHECKLIST:\n"
+                        "1. Use absolute imports: 'from tasks.<task_id>.task import ...'.\n"
+                        "2. ONLY import and test functions that you implemented in Phase 1. Check task.py context carefully.\n"
+                        "3. CALL functions exactly as defined in Phase 1.\n"
+                        "4. Compare devices using 'd1.type == d2.type' (CRITICAL).\n"
+                        "5. Use sufficient epochs (e.g. 100+) for integration tests."
                     )
+                    raw2, stats2 = agent.generate_content(task, phase2_prompt, context_code=phase1_code, error_log=last_err)
                     files2 = agent.extract_files(raw2)
 
                     combined_files = {**files1, **files2}
