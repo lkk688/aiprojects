@@ -18,7 +18,7 @@ output
 whisper_onnx_model/onnx__*
 whisper_onnx_model
 whisper_onnx_quantized_model
-
+.agent/
 docs
 llama.cpp/
 lm-evaluation-harness/
@@ -43,3 +43,5 @@ CodeAgent/qwen_coder_lora
 CodeAgent/outputs
 CodeAgent/outputs_sft_v2
 CodeAgent/evalplus_results
+
+lerobot/
