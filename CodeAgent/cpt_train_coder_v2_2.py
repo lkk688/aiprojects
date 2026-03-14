@@ -265,88 +265,79 @@ def _sample_dataset(ds: Dataset, n: int, strategy: str, seed: int) -> Dataset:
 
 
 def load_and_build_dataset(data_args: DataArguments, seed: int = 42) -> Dataset:
-    """
-    Load local + HF datasets, normalize to 'content' column (same logic as your original),
-    then *cap public data size proportional to private size* with minimal disruption to caches.
-    """
-    private_ds: Optional[Dataset] = None
-    public_datasets: List[Dataset] = []
+    datasets_to_concat: List[Dataset] = []
 
-    # 1) Local JSON/JSONL
+    # 1) Local JSON/JSONL files (保持不动)
+    private_ds = None
     if data_args.train_files:
         logger.info(f"Loading local datasets from: {data_args.train_files}")
-        local_raw = load_dataset("json", data_files=data_args.train_files, split="train")
-        private_ds = _normalize_local_ds(local_raw, data_args.text_fields)
-        logger.info(f"Private dataset size (after normalize/filter): {len(private_ds)}")
+        local_ds = load_dataset("json", data_files=data_args.train_files, split="train")
 
-    # 2) HF datasets
+        def normalize_local(ex):
+            txt = None
+            if "content" in ex and isinstance(ex["content"], str):
+                txt = ex["content"]
+            elif "text" in ex and isinstance(ex["text"], str):
+                txt = ex["text"]
+            else:
+                txt = _extract_text_from_example(ex, data_args.text_fields)
+            return {"content": txt if isinstance(txt, str) else ""}
+
+        local_ds = local_ds.map(normalize_local, desc="Normalizing local dataset")
+        local_ds = local_ds.filter(lambda x: isinstance(x["content"], str) and len(x["content"]) > 0)
+        private_ds = local_ds
+        datasets_to_concat.append(private_ds)
+
+    # ---- NEW: compute public target BEFORE loading huge HF datasets ----
+    n_private = len(private_ds) if private_ds is not None else 0
+    if data_args.public_to_private_ratio and n_private > 0:
+        n_public_target = int(n_private * float(data_args.public_to_private_ratio))
+        if data_args.public_max_samples is not None:
+            n_public_target = min(n_public_target, int(data_args.public_max_samples))
+        n_public_target = max(n_public_target, int(getattr(data_args, "public_min_samples", 0)))
+    else:
+        n_public_target = None  # means load all (not recommended for the-stack)
+
+    # 2) HF datasets (只改这里：按 quota slice 加载)
     if data_args.use_hf_datasets and data_args.hf_datasets:
+        # 简单策略：把 public quota 均分到每个 (dataset, split)
+        num_sources = len(data_args.hf_datasets) * len(data_args.hf_splits)
+        per_source = None
+        if n_public_target is not None and num_sources > 0:
+            per_source = max(1, n_public_target // num_sources)
+
         for name in data_args.hf_datasets:
             repo, subset = _parse_repo_and_subset(name)
             for split in data_args.hf_splits:
-                logger.info(f"Loading HF dataset: repo={repo}, subset={subset}, split={split}")
-                hf_raw = load_dataset(repo, subset, split=split)
-                hf_norm = _normalize_hf_ds(hf_raw, data_args.text_fields, name, split)
-                logger.info(f"Public source {name}/{split} size (after normalize/filter): {len(hf_norm)}")
-                public_datasets.append(hf_norm)
+                quota = per_source
 
-    if private_ds is None and not public_datasets:
+                # 关键：只加载 train[:quota]，避免全量 the-stack normalize
+                if quota is not None:
+                    split_spec = f"{split}[:{quota}]"
+                else:
+                    split_spec = split  # 不限量（慎用）
+
+                logger.info(f"Loading HF dataset: repo={repo}, subset={subset}, split={split_spec}")
+                hf_ds = load_dataset(repo, subset, split=split_spec)
+
+                def normalize_hf(ex):
+                    txt = _extract_text_from_example(ex, data_args.text_fields)
+                    return {"content": txt if isinstance(txt, str) else ""}
+
+                hf_ds = hf_ds.map(normalize_hf, desc=f"Normalizing HF dataset {name}/{split_spec}")
+                hf_ds = hf_ds.filter(lambda x: isinstance(x["content"], str) and len(x["content"]) > 0)
+                datasets_to_concat.append(hf_ds)
+
+    if not datasets_to_concat:
         raise ValueError("No datasets loaded. Provide --train_files and/or --hf_datasets.")
 
-    # Pool public
-    pooled_public: Optional[Dataset] = None
-    if public_datasets:
-        pooled_public = concatenate_datasets(public_datasets) if len(public_datasets) > 1 else public_datasets[0]
-        logger.info(f"Total public pooled size: {len(pooled_public)}")
+    logger.info(f"Concatenating {len(datasets_to_concat)} datasets...")
+    merged = concatenate_datasets(datasets_to_concat)
 
-    # 3) Cap/sampling public by private size (NEW)
-    sampled_public: Optional[Dataset] = None
-    if pooled_public is not None and private_ds is not None and data_args.public_to_private_ratio is not None:
-        ratio = float(data_args.public_to_private_ratio)
-        if ratio > 0:
-            target = int(len(private_ds) * ratio)
-            target = max(target, int(data_args.public_min_samples))
-            if data_args.public_max_samples is not None:
-                target = min(target, int(data_args.public_max_samples))
-
-            logger.info(f"Target public samples = private({len(private_ds)}) * {ratio} => {target}")
-
-            if data_args.balance_across_public_sources and len(public_datasets) > 1:
-                # roughly equal sample from each source
-                per = max(1, target // len(public_datasets))
-                parts = []
-                for i, ds in enumerate(public_datasets):
-                    parts.append(_sample_dataset(ds, per, data_args.public_sampling_strategy, seed + i))
-                sampled_public = concatenate_datasets(parts)
-                # trim to exact target
-                if len(sampled_public) > target:
-                    sampled_public = sampled_public.select(range(target))
-            else:
-                sampled_public = _sample_dataset(pooled_public, target, data_args.public_sampling_strategy, seed)
-
-            logger.info(f"Sampled public size: {len(sampled_public)}")
-        else:
-            logger.info("public_to_private_ratio <= 0, using all public data (no cap).")
-            sampled_public = pooled_public
-    else:
-        sampled_public = pooled_public  # may be None
-
-    # 4) Final merge
-    datasets_to_concat = []
-    if private_ds is not None:
-        datasets_to_concat.append(private_ds)
-    if sampled_public is not None:
-        datasets_to_concat.append(sampled_public)
-
-    merged = concatenate_datasets(datasets_to_concat) if len(datasets_to_concat) > 1 else datasets_to_concat[0]
-    logger.info(f"Final merged dataset size: {len(merged)}")
-
-    # Optional cap total
     if data_args.max_train_samples is not None and data_args.max_train_samples > 0:
-        n = min(len(merged), int(data_args.max_train_samples))
-        logger.info(f"Subsampling merged dataset to max_train_samples={n}")
-        merged = merged.select(range(n))
+        merged = merged.select(range(min(len(merged), data_args.max_train_samples)))
 
+    logger.info(f"Final merged dataset size: {len(merged)}")
     return merged
 
 
