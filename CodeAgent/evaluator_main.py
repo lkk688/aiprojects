@@ -22,8 +22,8 @@ from rich.console import Console
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from CodeAgent.llm_wrapper import complete_with_async, compute_stream_speed_metrics
-from CodeAgent.mini_batch_agent_libs import now_stamp, estimate_tokens
+# from CodeAgent.llm_wrapper import complete_with_async, compute_stream_speed_metrics
+# from CodeAgent.mini_batch_agent_libs import now_stamp, estimate_tokens
 
 console = Console()
 
@@ -41,6 +41,280 @@ LLM_REQUEST_ERRORS = (
     KeyError,
 )
 SUBPROCESS_ERRORS = (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError)
+
+
+# ==========================================
+# Simple Single-Shot Async Wrapper (No Continuation)
+# ==========================================
+import sys
+import json
+from typing import Any, List, Dict, Tuple, Optional
+from typing import List, Dict, Any, Optional, Tuple, Callable, Awaitable
+async def _execute_openai_async(
+    client: Any, model: str, messages: List[Dict[str, str]], 
+    temperature: float, max_tokens: int, stream: bool,
+    tools: Optional[List[Dict[str, Any]]] = None,
+    verbose: bool = False,
+    on_event: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+    backend: str = "openai",
+    enable_thinking: bool = True,
+) -> Tuple[str, str, Dict[str, int], List[Dict[str, Any]]]:
+    
+    kwargs = {
+        "model": model, "messages": messages, "temperature": temperature,
+        "max_tokens": max_tokens, "stream": stream,
+    }
+    
+    # ── Inject specific parameters for vllm/llama.cpp ──
+    if backend in ["llama.cpp", "vllm"] and enable_thinking is not None:
+        kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": enable_thinking}}
+        kwargs["stop"] = ["<|im_end|>", "<|im_start|>", "<|endoftext|>"]
+        
+    if tools: kwargs["tools"] = tools
+    if stream: kwargs["stream_options"] = {"include_usage": True}
+        
+    resp = await client.chat.completions.create(**kwargs)
+    
+    content = ""
+    finish_reason = "stop"
+    usage_info = {}
+    native_tool_calls = []
+    tc_dict = {}
+    
+    if stream:
+        chunk_counter = 0
+        
+        # State machine for suppressing XML tool prints & handling thinking
+        in_think = False
+        in_tool = False
+        buffer = ""
+        tool_args_buffer = ""
+        tool_name_buffer = ""
+        
+        async for chunk in resp:
+            chunk_counter += 1
+            
+            if not chunk.choices:
+                if hasattr(chunk, 'usage') and chunk.usage:
+                    usage_info = {"prompt_tokens": chunk.usage.prompt_tokens, "completion_tokens": chunk.usage.completion_tokens}
+                continue
+                
+            delta = chunk.choices[0].delta
+            
+            # --- 1. Extract Llama.cpp / Custom backends reasonings ---
+            reasoning = delta.model_dump().get("reasoning_content")
+            if reasoning:
+                if verbose:
+                    sys.stdout.write(f"\033[90m{reasoning}\033[0m")
+                    sys.stdout.flush()
+                if on_event:
+                    await on_event({"type": "think", "data": reasoning})
+            
+            # --- 2. Extract standard content ---
+            if delta.content:
+                text_chunk = delta.content
+                content += text_chunk
+                buffer += text_chunk
+                
+                # Tag detector
+                if not in_think and "<think>" in buffer:
+                    in_think = True
+                    buffer = buffer.split("<think>")[-1]
+                    
+                if in_think and "</think>" in buffer:
+                    in_think = False
+                    buffer = buffer.split("</think>")[-1]
+                    
+                if not in_tool and "<tool_call>" in buffer:
+                    in_tool = True
+                    buffer = buffer.split("<tool_call>")[-1]
+                    
+                if in_tool and "</tool_call>" in buffer:
+                    in_tool = False
+                    buffer = ""
+                    tool_args_buffer = ""
+                    tool_name_buffer = ""
+                
+                # Strip XML control tags from the visible text before emitting
+                clean_chunk = re.sub(r'</?think>|</?tool_call>', '', text_chunk)
+
+                # Text processing logic
+                if in_think:
+                    if verbose:
+                        sys.stdout.write(f"\033[90m{clean_chunk}\033[0m")
+                        sys.stdout.flush()
+                    if on_event and clean_chunk:
+                        await on_event({"type": "think", "data": clean_chunk})
+                elif in_tool:
+                    # Accumulate tool text silently
+                    tool_args_buffer += text_chunk
+
+                    # Try to extract the tool name if we haven't yet (simple regex logic)
+                    if not tool_name_buffer and ">" in tool_args_buffer:
+                        # e.g., <web_search> or <write_file>
+                        match = re.search(r"<([a-zA-Z0-9_]+)>", tool_args_buffer)
+                        if match:
+                            tool_name_buffer = match.group(1)
+                            if verbose:
+                                console.print(f"\n[bold magenta]🛠️ Parsing Tool: {tool_name_buffer}...[/bold magenta]")
+
+                    if on_event:
+                        await on_event({"type": "tool", "status": "streaming", "data": text_chunk})
+                else:
+                    # Normal message token — strip any stray tag fragments before emitting
+                    if clean_chunk:
+                        if verbose:
+                            sys.stdout.write(clean_chunk)
+                            sys.stdout.flush()
+                        if on_event:
+                            await on_event({"type": "message", "data": clean_chunk})
+                
+                        
+            # (后续解析 Tool Call 的逻辑保持不变)
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    if idx not in tc_dict:
+                        func_name = tc.function.name if tc.function and tc.function.name else "unknown_tool"
+                        tc_dict[idx] = {"name": func_name, "arguments": ""}
+                        if on_event:
+                            await on_event({"type": "tool", "name": func_name, "status": "started"})
+                        if verbose:
+                            console.print(f"\n[bold magenta]🛠️ Calling Tool: {func_name}...[/bold magenta]")
+                    
+                    if tc.function and tc.function.arguments:
+                        chunk_arg = tc.function.arguments
+                        tc_dict[idx]["arguments"] += chunk_arg
+                        if on_event:
+                            await on_event({"type": "tool", "name": tc_dict[idx]["name"], "args_delta": chunk_arg, "status": "streaming"})
+                            
+                # Optionally print fully completed arguments when finish_reason hits, but let's wait until outside the loop for summary if needed.
+                        
+            if chunk.choices[0].finish_reason:
+                finish_reason = chunk.choices[0].finish_reason
+                
+        if verbose and content and finish_reason != "repetition":
+            print()
+            
+        native_tool_calls = list(tc_dict.values())
+        
+    else:
+        # Non-streaming parsing
+        msg = resp.choices[0].message
+        content = msg.content or ""
+        finish_reason = resp.choices[0].finish_reason or "stop"
+        
+        if hasattr(resp, 'usage') and resp.usage:
+            usage_info = {
+                "prompt_tokens": resp.usage.prompt_tokens, 
+                "completion_tokens": resp.usage.completion_tokens
+            }
+            
+        if msg.tool_calls:
+            for tc in msg.tool_calls:
+                native_tool_calls.append({
+                    "name": tc.function.name, 
+                    "arguments": tc.function.arguments
+                })
+                
+    return content, finish_reason, usage_info, native_tool_calls
+
+
+async def complete_with_async(
+    client: Any,
+    model: str,
+    messages: List[Dict[str, str]],
+    temperature: float = 0.2,
+    max_output_tokens: int = 4096,
+    model_max_context: int = 16384,
+    provider: str = "openai",
+    stream: bool = True,
+    verbose: bool = False,
+    on_event: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+    backend: str = "openai",
+    enable_thinking: bool = True,
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Simple single-shot async wrapper for LLM API calls.
+
+    Unlike complete_with_continuation_async, this function:
+    - Does NOT loop on finish_reason == 'length' (no auto-continuation)
+    - Does NOT parse tool calls or agent actions
+    - Returns (content: str, usage_info: dict)
+
+    The optional `on_token` async callback receives each streamed token as it
+    arrives, enabling FastAPI SSE endpoints to forward tokens to clients in
+    real-time without any extra buffering.
+
+    Args:
+        client:            Async OpenAI-compatible client (or Anthropic client)
+        model:             Model name
+        messages:          List of chat messages (role/content dicts)
+        temperature:       Sampling temperature
+        max_output_tokens: Maximum completion tokens to request
+        model_max_context: Total context window size (for token budget calc)
+        provider:          'openai' or 'anthropic'
+        stream:            Enable streaming API (token-by-token)
+        verbose:           Print tokens to terminal as they arrive
+        on_token:          Optional async callback called for each streamed token.
+                           Signature: async def on_token(token: str) -> None
+
+    Returns:
+        (content, usage_info)  where usage_info has 'prompt_tokens',
+        'completion_tokens', 'elapsed_seconds', 'tokens_per_second',
+        and 'finish_reason' keys.
+    """
+    # --- 1. Adaptive Token Budget ---
+    input_text = "\n".join(m.get("content", "") for m in messages)
+    input_est = estimate_tokens(input_text)
+    min_output = 256
+    max_allowed_input = model_max_context - 1000 - min_output
+
+    safe_tokens = max_output_tokens #compute_safe_max_tokens(input_est, model_max_context, max_output_tokens, min_output)
+
+    # --- 2. Single API Call with Retries ---
+    content: str = ""
+    finish_reason: str = "stop"
+    usage_info: Dict[str, Any] = {}
+    start_time = time.time()
+
+    for attempt in range(3):
+        try:
+            content, finish_reason, usage_info, _ = await _execute_openai_async(
+                client, model, messages, temperature, safe_tokens,
+                stream=stream, tools=None, verbose=verbose, on_event=on_event,
+                backend=backend, enable_thinking=enable_thinking
+            )
+        except Exception as e:
+            err_str = str(e)
+            if "max_tokens" in err_str or "context length" in err_str:
+                safe_tokens = max(1024, safe_tokens // 2)
+                console.print(f"[red]Context overflow. Retrying max_tokens={safe_tokens}[/red]")
+                await asyncio.sleep(1)
+                continue
+            console.print(f"[red]LLM Call failed (attempt {attempt + 1}): {e}[/red]")
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            break  # Hard fail – return whatever we have
+
+    # --- 3. Metrics ---
+    elapsed = time.time() - start_time
+    
+    console.print(
+        f"[bold blue][LLM][/bold blue] [dim]"
+        f"{usage_info['prompt_tokens']}P, {usage_info['completion_tokens']}C | "
+        #f"{speed_metrics['e2e_tokens_per_second']:.1f} T/s | {elapsed:.1f}s | finish={finish_reason}[/dim]"
+    )
+
+    usage_info["elapsed_seconds"] = round(elapsed, 2)
+    # usage_info["tokens_per_second"] = round(speed_metrics["e2e_tokens_per_second"], 1)
+    # usage_info["prefill_tokens_per_second"] = round(speed_metrics["prefill_tokens_per_second"], 3)
+    # usage_info["decode_tokens_per_second"] = round(speed_metrics["decode_tokens_per_second"], 3)
+    # usage_info["per_token_decode_latency_ms"] = round(speed_metrics["per_token_decode_latency_ms"], 3)
+    usage_info["finish_reason"] = finish_reason
+
+    return content, usage_info
 
 
 @dataclass
@@ -1511,8 +1785,8 @@ if __name__ == "__main__":
 
 """
 python CodeAgent/evaluator_main.py \
-  --report-dirs eval_api_test eval_api_test_sft output/qwen27b_sft\
-  --report-labels "Base Qwen9b" "Qwen9b SFT" "Qwen27b" \
+  --report-dirs output/eval_api_test output/eval_api_test_sft output/qwen_eval_27b output/qwen_eval_35b\
+  --report-labels "Base Qwen9b" "Qwen9b SFT" "Qwen27b" "Qwen35b"\
   --report-output ./comparison_report
   
 """
